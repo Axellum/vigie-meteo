@@ -279,3 +279,24 @@ def test_validation_error_returns_rfc9457(tmp_path: Path, bad_lat: float) -> Non
         assert resp.status_code == 422
         assert resp.headers["content-type"].startswith("application/problem+json")
         assert resp.json()["status"] == 422
+
+
+def test_proxy_forecast_and_marine_endpoints(tmp_path: Path) -> None:
+    seen_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        if "/v1/marine" in str(request.url):
+            return httpx.Response(200, json={"current": {"wave_height": 0.94, "sea_surface_temperature": 16.6}})
+        return httpx.Response(200, json=_sample_open_meteo_payload())
+
+    with _make_client(tmp_path, handler) as client:
+        r_fc = client.get("/v1/forecast", params={"latitude": 43.65, "longitude": -1.45, "current": "temperature_2m"})
+        assert r_fc.status_code == 200
+        assert any("/v1/meteofrance" in u for u in seen_urls)
+
+        r_mar = client.get("/v1/marine", params={"latitude": 43.65, "longitude": -1.45, "current": "wave_height"})
+        assert r_mar.status_code == 200
+        assert r_mar.json()["current"]["wave_height"] == 0.94
+        assert any("/v1/marine" in u for u in seen_urls)
+

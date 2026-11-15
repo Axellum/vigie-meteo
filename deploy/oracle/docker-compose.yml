@@ -21,11 +21,11 @@ services:
       <<: *om-env
     volumes:
       - open_meteo_data:/app/data
-    # Synchronisation ciblée France uniquement (AROME HD 1,5 km + ARPEGE Europe 11 km)
+    # Synchronisation ciblée Météo-France (AROME HD 1,5 km + 15 min, ARPEGE Europe 11 km, MFWAM vagues, courants et SST)
     # --concurrent 1 pour préserver les 2 OCPU et le disque Oracle
     command: >
-      sync meteofrance_arome_france_hd,meteofrance_arpege_europe
-      temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m,wind_direction_10m,cloud_cover,surface_pressure,uv_index,shortwave_radiation,weather_code
+      sync meteofrance_arome_france_hd,meteofrance_arome_france_hd_15min,meteofrance_arpege_europe,meteofrance_wave,meteofrance_currents,meteofrance_sea_surface_temperature
+      temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m,wind_direction_10m,wind_u_component_10m,wind_v_component_10m,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,surface_pressure,pressure_msl,uv_index,shortwave_radiation,weather_code,snowfall_water_equivalent,cape,wave_height,wave_direction,wave_period,swell_wave_height,swell_wave_direction,swell_wave_period,secondary_swell_wave_height,secondary_swell_wave_direction,secondary_swell_wave_period,wind_wave_height,wind_wave_direction,wind_wave_period,ocean_u_current,ocean_v_current,sea_surface_temperature
       --past-days 2 --repeat-interval 60 --concurrent 1
     deploy:
       resources:
@@ -42,8 +42,9 @@ services:
     volumes:
       - open_meteo_data:/app/data
     command: ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
-    expose:
-      - "8080"
+    # Sur Oracle, la chaîne DOCKER-USER bloque l'interface publique et autorise WireGuard (wg0)
+    ports:
+      - "8080:8080"
     deploy:
       resources:
         limits:

@@ -118,10 +118,23 @@ class OpenMeteoCollector(ResilientCollector):
         return payload, status, s_lat, s_lon
 
     async def proxy_raw_forecast(self, query_params: dict[str, Any]) -> tuple[dict[str, Any] | None, SourceStatus]:
-        """Proxy transparent compatible `GET /v1/forecast` d'Open-Meteo."""
+        """Proxy transparent compatible `GET /v1/forecast` d'Open-Meteo (routé sur `/v1/meteofrance` par défaut)."""
         sorted_items = sorted((k, str(v)) for k, v in query_params.items())
         cache_key = "om:raw:" + "&".join(f"{k}={v}" for k, v in sorted_items)
-        url = f"{self._settings.open_meteo_base_url.rstrip('/')}/v1/forecast"
+        endpoint = "/v1/forecast" if "models" in query_params else "/v1/meteofrance"
+        url = f"{self._settings.open_meteo_base_url.rstrip('/')}{endpoint}"
+        return await self.fetch_with_cache(
+            cache_key=cache_key,
+            url=url,
+            ttl_seconds=self._settings.forecast_ttl_seconds,
+            params=query_params,
+        )
+
+    async def proxy_raw_marine(self, query_params: dict[str, Any]) -> tuple[dict[str, Any] | None, SourceStatus]:
+        """Proxy transparent compatible `GET /v1/marine` d'Open-Meteo (MFWAM vagues, courants et SST)."""
+        sorted_items = sorted((k, str(v)) for k, v in query_params.items())
+        cache_key = "om:marine:" + "&".join(f"{k}={v}" for k, v in sorted_items)
+        url = f"{self._settings.open_meteo_base_url.rstrip('/')}/v1/marine"
         return await self.fetch_with_cache(
             cache_key=cache_key,
             url=url,

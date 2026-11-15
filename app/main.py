@@ -239,6 +239,18 @@ def create_app(
             raise HTTPException(status_code=503, detail=f"Open-Meteo indisponible ({status.last_error}).")
         return payload
 
+    @app.get("/v1/marine", tags=["Compatibilité Open-Meteo"])
+    async def proxy_open_meteo_marine(request: Request) -> dict[str, Any]:
+        """Proxy compatible Open-Meteo `/v1/marine` (MFWAM vagues, courants, SST) avec cache SQLite local."""
+        om_collector: OpenMeteoCollector = request.app.state.om_collector
+        params = dict(request.query_params)
+        if "latitude" not in params or "longitude" not in params:
+            raise HTTPException(status_code=422, detail="Les paramètres 'latitude' et 'longitude' sont requis.")
+        payload, status = await om_collector.proxy_raw_marine(params)
+        if payload is None:
+            raise HTTPException(status_code=503, detail=f"Open-Meteo Marine indisponible ({status.last_error}).")
+        return payload
+
     return app
 
 
