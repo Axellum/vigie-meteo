@@ -1,0 +1,93 @@
+# Stack Docker optimisée pour Oracle Cloud Always Free (Ampere A1 : 2 OCPU ARM64, 12 Go RAM).
+# Démarre :
+# 1. open-meteo-sync : synchronise uniquement AROME HD + ARPEGE Europe (France)
+# 2. open-meteo      : moteur API Open-Meteo local (4 Go de cache RAM)
+# 3. meteo-api       : facade FastAPI unifiée (Open-Meteo + Vigilance + Pluie 1h + SQLite WAL)
+# 4. caddy           : reverse proxy HTTPS automatique (Let's Encrypt)
+
+volumes:
+  open_meteo_data:
+  meteo_api_data:
+  caddy_data:
+  caddy_config:
+
+x-om-env: &om-env
+  LOG_LEVEL: info
+  CACHE_SIZE: 4GB
+
+services:
+  open-meteo-sync:
+    image: ghcr.io/open-meteo/open-meteo:latest
+    container_name: open-meteo-sync
+    restart: unless-stopped
+    environment:
+      <<: *om-env
+    volumes:
+      - open_meteo_data:/app/data
+    # Synchronisation ciblée France uniquement (AROME HD 1,5 km + ARPEGE Europe 11 km)
+    # --concurrent 1 pour préserver les 2 OCPU et les IOPS disque Oracle
+    command: >
+      sync meteofrance_arome_france_hd,meteofrance_arpege_europe
+      temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m,wind_direction_10m,cloud_cover,surface_pressure,uv_index,shortwave_radiation,weather_code
+      --past-days 2 --repeat-interval 60 --concurrent 1
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  open-meteo:
+    image: ghcr.io/open-meteo/open-meteo:latest
+    container_name: open-meteo-api
+    restart: unless-stopped
+    user: "0"
+    environment:
+      <<: *om-env
+    volumes:
+      - open_meteo_data:/app/data
+    command: ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
+    expose:
+      - "8080"
+    deploy:
+      resources:
+        limits:
+          memory: 5G
+
+  meteo-api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: meteo-france-api
+    restart: unless-stopped
+    depends_on:
+      - open-meteo
+    env_file:
+      - ../../.env
+    environment:
+      METEO_DB_PATH: /data/meteo_cache.db
+      OPEN_METEO_BASE_URL: http://open-meteo:8080
+    volumes:
+      - meteo_api_data:/data
+    expose:
+      - "8000"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: meteo-caddy
+    restart: unless-stopped
+    depends_on:
+      - meteo-api
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    deploy:
+      resources:
+        limits:
+          memory: 128M

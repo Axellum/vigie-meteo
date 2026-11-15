@@ -1,0 +1,13 @@
+# Remplacer meteo.votre-domaine.fr par votre nom de domaine pointant vers l'IP publique Oracle
+# (ou utiliser ":80" pour tester en HTTP local sans nom de domaine).
+meteo.votre-domaine.fr {
+    encode zstd gzip
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+    }
+
+    reverse_proxy meteo-api:8000
+}
