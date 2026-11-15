@@ -300,3 +300,154 @@ def test_proxy_forecast_and_marine_endpoints(tmp_path: Path) -> None:
         assert r_mar.json()["current"]["wave_height"] == 0.94
         assert any("/v1/marine" in u for u in seen_urls)
 
+
+def _sample_arome_15m_payload() -> dict[str, Any]:
+    return {
+        "latitude": 43.65,
+        "longitude": -1.45,
+        "minutely_15": {
+            "time": ["2026-11-15T10:00", "2026-11-15T10:15", "2026-11-15T10:30", "2026-11-15T10:45"],
+            "precipitation": [0.0, 0.25, 0.9, 2.0],
+        },
+    }
+
+
+def _sample_paquet_obs_geojson() -> list[dict[str, Any]]:
+    # Format officiel GeoJSON DPPaquetObs v2 (liste de Features Point [lon, lat])
+    return [
+        {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [-1.51, 43.47]},
+            "properties": {
+                "geo_id_insee": "64024001",
+                "validity_time": "2026-11-15T10:00:00Z",
+                "t": 289.15,
+                "td": 285.15,
+                "u": 77,
+                "dd": 290,
+                "ff": 5.5,
+                "dxi10": 300,
+                "fxi10": 9.0,
+                "rr_per": 0.2,
+                "pmer": 101540,
+                "vv": 12000,
+            },
+        },
+        {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [2.35, 48.85]},
+            "properties": {
+                "geo_id_insee": "75114001",
+                "validity_time": "2026-11-15T10:00:00Z",
+                "t": 283.15,
+                "u": 82,
+                "ff": 2.0,
+                "rr_per": 0.0,
+                "pmer": 102000,
+            },
+        },
+    ]
+
+
+def test_rain_nowcast_falls_back_to_arome_15m_when_paquet_pluie_fails(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "paquet/pluie" in url:
+            return httpx.Response(404)
+        if "/v1/meteofrance" in url and "minutely_15" in url:
+            return httpx.Response(200, json=_sample_arome_15m_payload())
+        if "/v1/meteofrance" in url:
+            return httpx.Response(200, json=_sample_open_meteo_payload())
+        return httpx.Response(404)
+
+    with _make_client(tmp_path, handler) as client:
+        r_now = client.get("/v1/rain-nowcast", params={"lat": 43.65, "lon": -1.45})
+        assert r_now.status_code == 200
+        now_data = r_now.json()
+        assert now_data["status"] == "fresh"
+        assert now_data["source_model"] == "meteofrance_arome_france_hd_15min"
+        assert [s["rain_level"] for s in now_data["slices"]] == [1, 2, 3, 4]
+        assert now_data["slices"][1]["rain_mm_h"] == 1.0
+
+        r_weather = client.get("/v1/weather", params={"lat": 43.65, "lon": -1.45})
+        assert r_weather.status_code == 200
+        w_data = r_weather.json()
+        assert w_data["rain_nowcast"]["source_model"] == "meteofrance_arome_france_hd_15min"
+        assert len(w_data["rain_nowcast"]["slices"]) == 4
+
+
+def test_observations_v2_nearest_station_si_conversion_and_cache(tmp_path: Path) -> None:
+    obs_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal obs_calls
+        url = str(request.url)
+        if "DPPaquetObs/v2/paquet/stations/infrahoraire-6m" in url:
+            obs_calls += 1
+            assert "format=geojson" in url
+            assert request.headers.get("apikey") == "secret-mf-token-123"
+            return httpx.Response(200, json=_sample_paquet_obs_geojson())
+        if "/v1/meteofrance" in url and "minutely_15" in url:
+            return httpx.Response(200, json=_sample_arome_15m_payload())
+        if "/v1/meteofrance" in url:
+            return httpx.Response(200, json=_sample_open_meteo_payload())
+        return httpx.Response(404)
+
+    with _make_client(tmp_path, handler) as client:
+        # Proche de Biarritz/Anglet (43.48, -1.52) -> doit sélectionner 64024001 (< 5 km)
+        r1 = client.get("/v1/observations", params={"lat": 43.48, "lon": -1.52})
+        assert r1.status_code == 200
+        d1 = r1.json()
+        assert d1["source"]["status"] == "fresh"
+        assert d1["station"]["station_id"] == "64024001"
+        assert d1["station"]["temperature_c"] == 16.0
+        assert d1["station"]["dew_point_c"] == 12.0
+        assert d1["station"]["wind_speed_kmh"] == 19.8
+        assert d1["station"]["wind_gusts_kmh"] == 32.4
+        assert d1["station"]["pressure_msl_hpa"] == 1015.4
+        assert d1["station"]["distance_km"] < 5.0
+        assert obs_calls == 1
+
+        # Deuxième coordonnée (Paris) réutilise le paquet national en cache SQLite
+        r2 = client.get("/v1/observations", params={"lat": 48.85, "lon": 2.35})
+        assert r2.status_code == 200
+        assert r2.json()["station"]["station_id"] == "75114001"
+        assert r2.json()["station"]["temperature_c"] == 10.0
+        assert obs_calls == 1
+
+        # Inclusion optionnelle dans /v1/weather + vérification rayon
+        r3 = client.get("/v1/weather", params={"lat": 43.48, "lon": -1.52, "include_obs": "true"})
+        assert r3.status_code == 200
+        w3 = r3.json()
+        assert w3["observation"]["station_id"] == "64024001"
+        assert w3["sources"]["observation"]["status"] == "fresh"
+
+        r_far = client.get("/v1/observations", params={"lat": 45.0, "lon": 0.0, "radius_km": 10})
+        assert r_far.status_code == 200
+        assert r_far.json()["station"] is None
+
+
+def test_without_mf_key_uses_arome_15m_nowcast_and_reports_health(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/v1/meteofrance" in url and "minutely_15" in url:
+            return httpx.Response(200, json=_sample_arome_15m_payload())
+        if "/v1/meteofrance" in url:
+            return httpx.Response(200, json=_sample_open_meteo_payload())
+        return httpx.Response(404)
+
+    with _make_client(tmp_path, handler, mf_key=None) as client:
+        h = client.get("/v1/health")
+        assert h.status_code == 200
+        assert h.json()["sources"]["meteofrance-obs"]["status"] == "not_configured"
+
+        obs = client.get("/v1/observations", params={"lat": 43.48, "lon": -1.52})
+        assert obs.status_code == 200
+        assert obs.json()["source"]["status"] == "not_configured"
+        assert obs.json()["station"] is None
+
+        now = client.get("/v1/rain-nowcast", params={"lat": 43.48, "lon": -1.52})
+        assert now.status_code == 200
+        assert now.json()["source_model"] == "meteofrance_arome_france_hd_15min"
+
+

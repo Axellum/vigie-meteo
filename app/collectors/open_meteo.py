@@ -13,10 +13,13 @@ from app.models import (
     CurrentWeather,
     DailyForecastPoint,
     HourlyForecastPoint,
+    RainNowcastBlock,
+    RainNowcastSlice,
     SourceStatus,
 )
 
 AROME_HD_MODEL = "meteofrance_arome_france_hd"
+AROME_HD_15M_MODEL = "meteofrance_arome_france_hd_15min"
 ARPEGE_EUROPE_MODEL = "meteofrance_arpege_europe"
 
 HOURLY_VARS = (
@@ -76,6 +79,34 @@ class OpenMeteoCollector(ResilientCollector):
 
     provider_name = "open-meteo"
 
+    async def _fetch_meteofrance(
+        self,
+        cache_key: str,
+        ttl_seconds: int,
+        params: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, SourceStatus]:
+        """Interroge `/v1/meteofrance` sur l'instance primaire avec repli configurable."""
+        primary_url = f"{self._settings.open_meteo_base_url.rstrip('/')}/v1/meteofrance"
+        payload, status = await self.fetch_with_cache(
+            cache_key=cache_key,
+            url=primary_url,
+            ttl_seconds=ttl_seconds,
+            params=params,
+        )
+
+        # Repli vers l'API publique Open-Meteo si l'instance locale n'est pas joignable
+        if payload is None and self._settings.open_meteo_fallback_url:
+            fallback_url = f"{self._settings.open_meteo_fallback_url.rstrip('/')}/v1/meteofrance"
+            if fallback_url != primary_url:
+                payload, status = await self.fetch_with_cache(
+                    cache_key=cache_key,
+                    url=fallback_url,
+                    ttl_seconds=ttl_seconds,
+                    params=params,
+                )
+
+        return payload, status
+
     async def get_france_forecast(
         self,
         lat: float,
@@ -96,26 +127,72 @@ class OpenMeteoCollector(ResilientCollector):
             "forecast_days": days,
             "timezone": "UTC",
         }
-        primary_url = f"{self._settings.open_meteo_base_url.rstrip('/')}/v1/meteofrance"
-        payload, status = await self.fetch_with_cache(
-            cache_key=cache_key,
-            url=primary_url,
-            ttl_seconds=self._settings.forecast_ttl_seconds,
-            params=params,
-        )
-
-        # Repli vers l'API publique Open-Meteo si l'instance locale n'est pas joignable
-        if payload is None and self._settings.open_meteo_fallback_url:
-            fallback_url = f"{self._settings.open_meteo_fallback_url.rstrip('/')}/v1/meteofrance"
-            if fallback_url != primary_url:
-                payload, status = await self.fetch_with_cache(
-                    cache_key=cache_key,
-                    url=fallback_url,
-                    ttl_seconds=self._settings.forecast_ttl_seconds,
-                    params=params,
-                )
-
+        payload, status = await self._fetch_meteofrance(cache_key, self._settings.forecast_ttl_seconds, params)
         return payload, status, s_lat, s_lon
+
+    async def get_rain_nowcast_15m(
+        self,
+        lat: float,
+        lon: float,
+    ) -> tuple[RainNowcastBlock, SourceStatus]:
+        """Récupère les précipitations 15 min AROME HD en repli du nowcast pluie officiel."""
+        s_lat = snap_coord(lat, step=0.01)
+        s_lon = snap_coord(lon, step=0.01)
+        cache_key = f"om:rain15m:{s_lat}:{s_lon}"
+        params = {
+            "latitude": s_lat,
+            "longitude": s_lon,
+            "models": AROME_HD_15M_MODEL,
+            "minutely_15": "precipitation",
+            "forecast_minutely_15": 8,
+            "timezone": "UTC",
+        }
+        payload, status = await self._fetch_meteofrance(cache_key, self._settings.nowcast_ttl_seconds, params)
+        if payload is None:
+            return RainNowcastBlock(
+                status=status.status,
+                slices=[],
+                updated_at=status.updated_at,
+                source_model=AROME_HD_15M_MODEL,
+            ), status
+
+        slices = self.parse_rain_nowcast_15m(payload)
+        return RainNowcastBlock(
+            status=status.status,
+            slices=slices,
+            updated_at=status.updated_at,
+            source_model=AROME_HD_15M_MODEL,
+        ), status
+
+    @staticmethod
+    def parse_rain_nowcast_15m(payload: dict[str, Any]) -> list[RainNowcastSlice]:
+        """Convertit les tranches `minutely_15.precipitation` (mm/15 min) en `RainNowcastSlice`."""
+        m15 = payload.get("minutely_15")
+        if not isinstance(m15, dict):
+            return []
+        times = m15.get("time") or []
+        values = m15.get(f"precipitation_{AROME_HD_15M_MODEL}") or m15.get("precipitation") or []
+        slices: list[RainNowcastSlice] = []
+        for idx, raw_time in enumerate(times):
+            dt = _parse_iso_dt(raw_time)
+            if dt is None:
+                continue
+            raw_val = values[idx] if idx < len(values) else None
+            if raw_val is None:
+                slices.append(RainNowcastSlice(time=dt))
+                continue
+            precip_15m = float(raw_val)
+            mm_h = round(precip_15m * 4.0, 2)
+            if precip_15m < 0.05:
+                level, label = 1, "Temps sec"
+            elif precip_15m < 0.4:
+                level, label = 2, "Pluie faible"
+            elif precip_15m < 1.5:
+                level, label = 3, "Pluie modérée"
+            else:
+                level, label = 4, "Pluie forte"
+            slices.append(RainNowcastSlice(time=dt, rain_level=level, rain_label=label, rain_mm_h=mm_h))
+        return slices
 
     async def proxy_raw_forecast(self, query_params: dict[str, Any]) -> tuple[dict[str, Any] | None, SourceStatus]:
         """Proxy transparent compatible `GET /v1/forecast` d'Open-Meteo (routé sur `/v1/meteofrance` par défaut)."""

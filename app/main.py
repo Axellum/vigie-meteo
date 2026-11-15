@@ -12,6 +12,7 @@ from app import __version__
 from app.cache import CacheStore
 from app.collectors.meteofrance import (
     MeteoFranceNowcastCollector,
+    MeteoFranceObservationsCollector,
     MeteoFranceVigilanceCollector,
 )
 from app.collectors.open_meteo import OpenMeteoCollector
@@ -19,6 +20,7 @@ from app.config import Settings, get_settings, redact_secret
 from app.models import (
     CompactWeatherResponse,
     HealthResponse,
+    ObservationsResponse,
     ProblemDetail,
     RainNowcastBlock,
     SourceStatus,
@@ -44,13 +46,15 @@ def create_app(
         om_collector = OpenMeteoCollector(client, cache, cfg)
         vig_collector = MeteoFranceVigilanceCollector(client, cache, cfg)
         now_collector = MeteoFranceNowcastCollector(client, cache, cfg)
-        service = WeatherAggregatorService(om_collector, vig_collector, now_collector)
+        obs_collector = MeteoFranceObservationsCollector(client, cache, cfg)
+        service = WeatherAggregatorService(om_collector, vig_collector, now_collector, obs_collector)
 
         app_instance.state.settings = cfg
         app_instance.state.cache = cache
         app_instance.state.om_collector = om_collector
         app_instance.state.vig_collector = vig_collector
         app_instance.state.now_collector = now_collector
+        app_instance.state.obs_collector = obs_collector
         app_instance.state.weather_service = service
 
         try:
@@ -109,7 +113,7 @@ def create_app(
         db_ok = cache.ping()
 
         sources: dict[str, SourceStatus] = {}
-        for provider in ("open-meteo", "meteofrance-vigilance", "meteofrance-nowcast"):
+        for provider in ("open-meteo", "meteofrance-vigilance", "meteofrance-nowcast", "meteofrance-obs"):
             st = cache.get_provider_state(provider)
             if provider.startswith("meteofrance") and cfg.meteofrance_api_key is None:
                 status_val = "not_configured"
@@ -142,10 +146,14 @@ def create_app(
         lon: float = Query(..., ge=-180.0, le=180.0, description="Longitude WGS84."),
         dept: str | None = Query(default=None, min_length=2, max_length=3, description="Code département (ex: 75, 40, 2A)."),
         days: int = Query(default=4, ge=1, le=7, description="Nombre de jours de prévision (1 à 7)."),
+        include_obs: bool = Query(
+            default=False,
+            description="Si vrai, inclut l'observation sol 6 min DPPaquetObs v2 de la station la plus proche.",
+        ),
     ) -> UnifiedWeatherResponse:
         """Retourne les prévisions fusionnées (AROME HD + ARPEGE), la pluie à 1h et la vigilance."""
         service: WeatherAggregatorService = request.app.state.weather_service
-        result = await service.get_unified_weather(lat=lat, lon=lon, dept=dept, days=days)
+        result = await service.get_unified_weather(lat=lat, lon=lon, dept=dept, days=days, include_obs=include_obs)
         if result.sources["forecast"].status == "unavailable":
             raise HTTPException(status_code=503, detail="Source de prévision indisponible et aucun cache valide.")
         response.headers["Cache-Control"] = f"public, max-age={min(cfg.nowcast_ttl_seconds, 180)}"
@@ -223,9 +231,23 @@ def create_app(
         lat: float = Query(..., ge=-90.0, le=90.0),
         lon: float = Query(..., ge=-180.0, le=180.0),
     ) -> RainNowcastBlock:
-        """Retourne uniquement la prévision de pluie dans l'heure (pas de 5-10 min)."""
+        """Retourne la pluie dans l'heure officielle ou le repli AROME HD 15 min."""
         service: WeatherAggregatorService = request.app.state.weather_service
         return await service.get_rain_nowcast(lat=lat, lon=lon)
+
+    @app.get("/v1/observations", response_model=ObservationsResponse, tags=["Météo"])
+    async def get_observations(
+        request: Request,
+        response: Response,
+        lat: float = Query(..., ge=-90.0, le=90.0, description="Latitude WGS84."),
+        lon: float = Query(..., ge=-180.0, le=180.0, description="Longitude WGS84."),
+        radius_km: float = Query(default=50.0, ge=1.0, le=200.0, description="Rayon maximal de recherche en km."),
+    ) -> ObservationsResponse:
+        """Retourne l'observation 6 min la plus proche via Météo-France `DPPaquetObs v2`."""
+        service: WeatherAggregatorService = request.app.state.weather_service
+        result = await service.get_nearest_observation(lat=lat, lon=lon, radius_km=radius_km)
+        response.headers["Cache-Control"] = f"public, max-age={cfg.obs_ttl_seconds}"
+        return result
 
     @app.get("/v1/forecast", tags=["Compatibilité Open-Meteo"])
     async def proxy_open_meteo_forecast(request: Request) -> dict[str, Any]:

@@ -105,6 +105,10 @@ class RainNowcastBlock(BaseModel):
     status: FreshnessStatus
     slices: list[RainNowcastSlice] = Field(default_factory=list)
     updated_at: datetime | None = None
+    source_model: str | None = Field(
+        default=None,
+        description="Modèle ou API source (ex: meteofrance-nowcast, meteofrance_arome_france_hd_15min).",
+    )
 
 
 class VigilancePhenomenon(BaseModel):
@@ -136,11 +140,42 @@ class VigilanceBlock(BaseModel):
     department: VigilanceDepartment | None = None
 
 
+class ObservationStation(BaseModel):
+    """Observation sol temps réel 6 minutes issue de Météo-France (DPPaquetObs v2)."""
+
+    station_id: str = Field(..., description="Identifiant INSEE de la station à 8 chiffres (`geo_id_insee`).")
+    latitude: float
+    longitude: float
+    distance_km: float
+    observed_at: datetime
+    temperature_c: float | None = None
+    dew_point_c: float | None = None
+    relative_humidity_pct: int | None = None
+    wind_speed_kmh: float | None = None
+    wind_direction_deg: int | None = None
+    wind_gusts_kmh: float | None = None
+    wind_gusts_direction_deg: int | None = None
+    precipitation_6m_mm: float | None = None
+    pressure_msl_hpa: float | None = None
+    visibility_m: int | None = None
+
+
+class ObservationsResponse(BaseModel):
+    """Réponse de `GET /v1/observations` (station Météo-France la plus proche)."""
+
+    latitude: float
+    longitude: float
+    radius_km: float
+    source: SourceStatus
+    station: ObservationStation | None = None
+
+
 class Attribution(BaseModel):
     """Mentions légales et crédits obligatoires des fournisseurs."""
 
     forecast: str = "Open-Meteo (CC BY 4.0) / Météo-France AROME & ARPEGE (Licence Ouverte Etalab 2.0)"
     vigilance: str = "Météo-France (Licence Ouverte Etalab 2.0)"
+    observation: str = "Météo-France DPPaquetObs v2 (Licence Ouverte Etalab 2.0)"
 
 
 class UnifiedWeatherResponse(BaseModel):
@@ -154,6 +189,7 @@ class UnifiedWeatherResponse(BaseModel):
     timezone: str = "Europe/Paris"
     generated_at: datetime
     current: CurrentWeather | None = None
+    observation: ObservationStation | None = None
     rain_nowcast: RainNowcastBlock
     vigilance: VigilanceBlock
     hourly: list[HourlyForecastPoint] = Field(default_factory=list)

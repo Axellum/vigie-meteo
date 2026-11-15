@@ -32,7 +32,9 @@ class Settings(BaseSettings):
         alias="OPEN_METEO_FALLBACK_URL",
     )
 
-    # Portail API officiel Météo-France (pour vigilances + pluie dans l'heure)
+    # Portail API officiel Météo-France (Vigilances, Observations 6 min DPPaquetObs v2, Nowcast)
+    # Note : `/public/DPPaquetObs/v1/paquet/pluie` ne figure pas dans les Swagger DPPaquetObs v1/v2
+    # (la lame d'eau immédiate officielle est servie par PIAF WCS `/pro/piaf/1.0` ou le repli AROME 15 min).
     meteofrance_api_key: SecretStr | None = Field(default=None, alias="METEOFRANCE_API_KEY")
     meteofrance_vigilance_url: str = Field(
         default="https://public-api.meteofrance.fr/public/DPVigilance/v1/cartevigilance/encours",
@@ -42,11 +44,16 @@ class Settings(BaseSettings):
         default="https://public-api.meteofrance.fr/public/DPPaquetObs/v1/paquet/pluie",
         alias="METEOFRANCE_NOWCAST_URL",
     )
+    meteofrance_paquet_obs_url: str = Field(
+        default="https://public-api.meteofrance.fr/public/DPPaquetObs/v2/paquet/stations/infrahoraire-6m",
+        alias="METEOFRANCE_PAQUET_OBS_URL",
+    )
 
     # Durées de vie du cache (TTL en secondes) et fenêtre de tolérance "stale"
     forecast_ttl_seconds: int = Field(default=900, alias="METEO_FORECAST_TTL_SECONDS")
     vigilance_ttl_seconds: int = Field(default=300, alias="METEO_VIGILANCE_TTL_SECONDS")
     nowcast_ttl_seconds: int = Field(default=180, alias="METEO_NOWCAST_TTL_SECONDS")
+    obs_ttl_seconds: int = Field(default=360, alias="METEO_OBS_TTL_SECONDS")
     max_stale_seconds: int = Field(default=86400, alias="METEO_MAX_STALE_SECONDS")
 
     # Circuit breaker (protection contre les 429 / 502 / timeouts amont)
