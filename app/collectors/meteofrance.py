@@ -61,7 +61,8 @@ class MeteoFranceVigilanceCollector(ResilientCollector):
         token = self._settings.meteofrance_api_key.get_secret_value().strip()
         if not token:
             return None
-        return {"apikey": token, "Authorization": f"Bearer {token}"}
+        # WSO2 (Météo-France) rejette avec 401 si Authorization: Bearer est envoyé avec un token apiKey
+        return {"apikey": token, "accept": "*/*"}
 
     async def get_all_vigilances(self) -> tuple[dict[str, Any] | None, SourceStatus]:
         """Récupère la carte de vigilance France entière (avec cache global)."""
@@ -162,7 +163,8 @@ class MeteoFranceNowcastCollector(ResilientCollector):
         token = self._settings.meteofrance_api_key.get_secret_value().strip()
         if not token:
             return None
-        return {"apikey": token, "Authorization": f"Bearer {token}"}
+        # WSO2 (Météo-France) rejette avec 401 si Authorization: Bearer est envoyé avec un token apiKey
+        return {"apikey": token, "accept": "*/*"}
 
     async def get_rain_nowcast(self, lat: float, lon: float) -> tuple[RainNowcastBlock, SourceStatus]:
         """Récupère les tranches de pluie dans l'heure pour un point GPS snappé."""
