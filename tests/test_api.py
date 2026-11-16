@@ -60,44 +60,6 @@ def _sample_open_meteo_payload() -> dict[str, Any]:
     }
 
 
-def _sample_vigilance_payload() -> dict[str, Any]:
-    return {
-        "product": {
-            "update_time": "2026-11-15T09:00:00Z",
-            "periods": [
-                {
-                    "end_validity_time": "2026-11-16T00:00:00Z",
-                    "timelaps": {
-                        "domain_ids": [
-                            {
-                                "domain_id": "75",
-                                "max_color_id": 3,
-                                "phenomenon_items": [
-                                    {
-                                        "phenomenon_id": 3,
-                                        "phenomenon_max_color_id": 3,
-                                        "timelaps_items": [
-                                            {
-                                                "begin_time": "2026-11-15T12:00:00Z",
-                                                "end_time": "2026-11-15T20:00:00Z",
-                                            }
-                                        ],
-                                    }
-                                ],
-                            },
-                            {
-                                "domain_id": "40",
-                                "max_color_id": 1,
-                                "phenomenon_items": [],
-                            },
-                        ]
-                    },
-                }
-            ],
-        }
-    }
-
-
 def _piaf_xml(value: float | str) -> str:
     """Réponse GML d'un point PIAF, au format renvoyé par le WCS (vérifié le 16/11/2026)."""
     return (
@@ -146,14 +108,12 @@ def test_unified_weather_merges_arome_arpege_and_meteofrance(tmp_path: Path) -> 
         url = str(request.url)
         if "/v1/meteofrance" in url:
             return httpx.Response(200, json=_sample_open_meteo_payload())
-        if "cartevigilance" in url:
-            return httpx.Response(200, json=_sample_vigilance_payload())
         if "/pro/piaf/" in url:
             return _piaf_response(request)
         return httpx.Response(404)
 
     with _make_client(tmp_path, handler) as client:
-        resp = client.get("/v1/weather", params={"lat": 48.8566, "lon": 2.3522, "dept": "75"})
+        resp = client.get("/v1/weather", params={"lat": 48.8566, "lon": 2.3522})
         assert resp.status_code == 200
         data = resp.json()
 
@@ -164,10 +124,9 @@ def test_unified_weather_merges_arome_arpege_and_meteofrance(tmp_path: Path) -> 
         assert data["hourly"][2]["source_model"] == "meteofrance_arpege_europe"
         assert data["hourly"][2]["temperature_c"] == 15.2
 
-        # Vigilance officielle intacte
-        assert data["vigilance"]["status"] == "fresh"
-        assert data["vigilance"]["department"]["color"] == "orange"
-        assert data["vigilance"]["department"]["phenomena"][0]["name"] == "Orages"
+        # Vigilances et observations : lues par Vigie elle-même, plus par la passerelle
+        assert "vigilance" not in data and "observation" not in data
+        assert set(data["sources"]) == {"forecast", "rain_nowcast"}
 
         # Pluie dans l'heure
         assert data["rain_nowcast"]["status"] == "fresh"
@@ -182,23 +141,19 @@ def test_stale_while_revalidate_and_circuit_breaker_on_502(tmp_path: Path) -> No
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        if "/v1/meteofrance" in url:
-            return httpx.Response(200, json=_sample_open_meteo_payload())
-        if "cartevigilance" in url:
+        if "/pro/piaf/" in url:
             if mf_should_fail:
                 return httpx.Response(502, text="Bad Gateway secret-mf-token-123")
-            return httpx.Response(200, json=_sample_vigilance_payload())
-        if "/pro/piaf/" in url:
             return _piaf_response(request)
         return httpx.Response(404)
 
     with _make_client(tmp_path, handler) as client:
-        # 1. Premier appel : tout est frais et mis en cache
-        r1 = client.get("/v1/vigilances", params={"dept": "75"})
+        # 1. Premier appel : PIAF frais, mis en cache
+        r1 = client.get("/v1/rain-nowcast", params={"lat": 48.85, "lon": 2.35})
         assert r1.status_code == 200
         assert r1.json()["status"] == "fresh"
 
-        # 2. On simule une panne 502 Météo-France et on force l'expiration TTL (10 min > 5 min TTL, < 24 h max_stale)
+        # 2. Panne 502 de Météo-France et cache expiré (10 min > 5 min de TTL, < 24 h de max_stale)
         mf_should_fail = True
         import time
 
@@ -208,13 +163,15 @@ def test_stale_while_revalidate_and_circuit_breaker_on_502(tmp_path: Path) -> No
         )
         client.app.state.cache._conn.commit()
 
-        r2 = client.get("/v1/vigilances", params={"dept": "75"})
+        r2 = client.get("/v1/rain-nowcast", params={"lat": 48.85, "lon": 2.35})
         assert r2.status_code == 200
         body = r2.json()
         assert body["status"] == "stale"
-        assert body["departments"][0]["color"] == "orange"
-        # Vérifie que le secret Météo-France est bien masqué dans last_error
-        assert "secret-mf-token-123" not in (body["source"]["last_error"] or "")
+        assert body["source_model"] == "meteofrance-piaf"
+        assert len(body["slices"]) == 12
+        # Le secret Météo-France est masqué dans last_error
+        health = client.get("/v1/health").json()
+        assert "secret-mf-token-123" not in (health["sources"]["meteofrance-nowcast"]["last_error"] or "")
 
 
 def test_compact_endpoint_under_4kb_for_esp32(tmp_path: Path) -> None:
@@ -222,36 +179,29 @@ def test_compact_endpoint_under_4kb_for_esp32(tmp_path: Path) -> None:
         url = str(request.url)
         if "/v1/meteofrance" in url:
             return httpx.Response(200, json=_sample_open_meteo_payload())
-        if "cartevigilance" in url:
-            return httpx.Response(200, json=_sample_vigilance_payload())
         if "/pro/piaf/" in url:
             return _piaf_response(request)
         return httpx.Response(404)
 
     with _make_client(tmp_path, handler) as client:
-        resp = client.get("/v1/compact", params={"lat": 48.85, "lon": 2.35, "dept": "75"})
+        resp = client.get("/v1/compact", params={"lat": 48.85, "lon": 2.35})
         assert resp.status_code == 200
         raw_bytes = len(resp.content)
         assert raw_bytes < 4096
         data = resp.json()
         assert data["temp_c"] == 12.4
-        assert data["vig_lvl"] == 3
+        assert "vig_lvl" not in data and "dept" not in data
         assert data["rain_1h_max"] == 3
 
 
-def test_vigilances_geojson_rfc7946(tmp_path: Path) -> None:
+def test_vigilance_and_observation_routes_are_gone(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if "cartevigilance" in str(request.url):
-            return httpx.Response(200, json=_sample_vigilance_payload())
-        return httpx.Response(404)
+        raise AssertionError(f"aucun appel amont attendu : {request.url}")
 
     with _make_client(tmp_path, handler) as client:
-        resp = client.get("/v1/vigilances/geojson")
-        assert resp.status_code == 200
-        geo = resp.json()
-        assert geo["type"] == "FeatureCollection"
-        assert len(geo["features"]) == 2
-        assert geo["features"][0]["type"] == "Feature"
+        for path in ("/v1/vigilances", "/v1/vigilances/geojson", "/v1/observations?lat=48.85&lon=2.35"):
+            assert client.get(path).status_code == 404, path
+        assert set(client.get("/v1/health").json()["sources"]) == {"open-meteo", "meteofrance-nowcast"}
 
 
 def test_api_key_auth_and_rfc9457_problem_json(tmp_path: Path) -> None:
@@ -324,43 +274,6 @@ def _sample_arome_15m_payload() -> dict[str, Any]:
     }
 
 
-def _sample_paquet_obs_geojson() -> list[dict[str, Any]]:
-    # Format officiel GeoJSON DPPaquetObs v2 (liste de Features Point [lon, lat])
-    return [
-        {
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [-1.51, 43.47]},
-            "properties": {
-                "geo_id_insee": "64024001",
-                "validity_time": "2026-11-15T10:00:00Z",
-                "t": 289.15,
-                "td": 285.15,
-                "u": 77,
-                "dd": 290,
-                "ff": 5.5,
-                "dxi10": 300,
-                "fxi10": 9.0,
-                "rr_per": 0.2,
-                "pmer": 101540,
-                "vv": 12000,
-            },
-        },
-        {
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [2.35, 48.85]},
-            "properties": {
-                "geo_id_insee": "75114001",
-                "validity_time": "2026-11-15T10:00:00Z",
-                "t": 283.15,
-                "u": 82,
-                "ff": 2.0,
-                "rr_per": 0.0,
-                "pmer": 102000,
-            },
-        },
-    ]
-
-
 def test_rain_nowcast_falls_back_to_arome_15m_when_piaf_fails(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -388,57 +301,6 @@ def test_rain_nowcast_falls_back_to_arome_15m_when_piaf_fails(tmp_path: Path) ->
         assert len(w_data["rain_nowcast"]["slices"]) == 4
 
 
-def test_observations_v2_nearest_station_si_conversion_and_cache(tmp_path: Path) -> None:
-    obs_calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal obs_calls
-        url = str(request.url)
-        if "DPPaquetObs/v2/paquet/stations/infrahoraire-6m" in url:
-            obs_calls += 1
-            assert "format=geojson" in url
-            assert request.headers.get("apikey") == "secret-mf-token-123"
-            return httpx.Response(200, json=_sample_paquet_obs_geojson())
-        if "/v1/meteofrance" in url and "minutely_15" in url:
-            return httpx.Response(200, json=_sample_arome_15m_payload())
-        if "/v1/meteofrance" in url:
-            return httpx.Response(200, json=_sample_open_meteo_payload())
-        return httpx.Response(404)
-
-    with _make_client(tmp_path, handler) as client:
-        # Proche de Biarritz/Anglet (43.48, -1.52) -> doit sélectionner 64024001 (< 5 km)
-        r1 = client.get("/v1/observations", params={"lat": 43.48, "lon": -1.52})
-        assert r1.status_code == 200
-        d1 = r1.json()
-        assert d1["source"]["status"] == "fresh"
-        assert d1["station"]["station_id"] == "64024001"
-        assert d1["station"]["temperature_c"] == 16.0
-        assert d1["station"]["dew_point_c"] == 12.0
-        assert d1["station"]["wind_speed_kmh"] == 19.8
-        assert d1["station"]["wind_gusts_kmh"] == 32.4
-        assert d1["station"]["pressure_msl_hpa"] == 1015.4
-        assert d1["station"]["distance_km"] < 5.0
-        assert obs_calls == 1
-
-        # Deuxième coordonnée (Paris) réutilise le paquet national en cache SQLite
-        r2 = client.get("/v1/observations", params={"lat": 48.85, "lon": 2.35})
-        assert r2.status_code == 200
-        assert r2.json()["station"]["station_id"] == "75114001"
-        assert r2.json()["station"]["temperature_c"] == 10.0
-        assert obs_calls == 1
-
-        # Inclusion optionnelle dans /v1/weather + vérification rayon
-        r3 = client.get("/v1/weather", params={"lat": 43.48, "lon": -1.52, "include_obs": "true"})
-        assert r3.status_code == 200
-        w3 = r3.json()
-        assert w3["observation"]["station_id"] == "64024001"
-        assert w3["sources"]["observation"]["status"] == "fresh"
-
-        r_far = client.get("/v1/observations", params={"lat": 45.0, "lon": 0.0, "radius_km": 10})
-        assert r_far.status_code == 200
-        assert r_far.json()["station"] is None
-
-
 def test_without_mf_key_uses_arome_15m_nowcast_and_reports_health(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -451,18 +313,11 @@ def test_without_mf_key_uses_arome_15m_nowcast_and_reports_health(tmp_path: Path
     with _make_client(tmp_path, handler, mf_key=None) as client:
         h = client.get("/v1/health")
         assert h.status_code == 200
-        assert h.json()["sources"]["meteofrance-obs"]["status"] == "not_configured"
-
-        obs = client.get("/v1/observations", params={"lat": 43.48, "lon": -1.52})
-        assert obs.status_code == 200
-        assert obs.json()["source"]["status"] == "not_configured"
-        assert obs.json()["station"] is None
+        assert h.json()["sources"]["meteofrance-nowcast"]["status"] == "not_configured"
 
         now = client.get("/v1/rain-nowcast", params={"lat": 43.48, "lon": -1.52})
         assert now.status_code == 200
         assert now.json()["source_model"] == "meteofrance_arome_france_hd_15min"
-
-
 
 
 def test_piaf_helpers_run_candidates_parse_and_levels() -> None:

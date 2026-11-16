@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "meteo-france-api"
 version = "0.1.0"
-description = "Facade API unifiée et résiliente pour la météo en France : Open-Meteo (AROME HD + ARPEGE) + Vigilances et Pluie à 1h Météo-France, avec cache SQLite WAL et circuit breaker."
+description = "Facade API unifiée et résiliente pour la météo en France : Open-Meteo (AROME HD + ARPEGE) + pluie dans l'heure Météo-France PIAF, avec cache SQLite WAL et circuit breaker."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
