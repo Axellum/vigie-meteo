@@ -98,15 +98,25 @@ def _sample_vigilance_payload() -> dict[str, Any]:
     }
 
 
-def _sample_nowcast_payload() -> dict[str, Any]:
-    return {
-        "properties": {
-            "forecast": [
-                {"time": "2026-11-15T10:05:00Z", "rain_intensity": 1, "rain_intensity_description": "Temps sec"},
-                {"time": "2026-11-15T10:15:00Z", "rain_intensity": 3, "rain_intensity_description": "Pluie modérée"},
-            ]
-        }
-    }
+def _piaf_xml(value: float | str) -> str:
+    """Réponse GML d'un point PIAF, au format renvoyé par le WCS (vérifié le 16/11/2026)."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?><gmlcov:ReferenceableGridCoverage '
+        'xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:gmlcov="http://www.opengis.net/gmlcov/1.0">'
+        f"<gml:rangeSet><gml:DataBlock><gml:tupleList>  {value}  "
+        "</gml:tupleList></gml:DataBlock></gml:rangeSet></gmlcov:ReferenceableGridCoverage>"
+    )
+
+
+def _piaf_step(request: httpx.Request) -> int:
+    subsets = request.url.params.get_list("subset")
+    time_subset = next(s for s in subsets if s.startswith("time("))
+    return int(time_subset[5:-1])
+
+
+def _piaf_response(request: httpx.Request) -> httpx.Response:
+    """PIAF simulé : sec, sauf 0,3 mm en 5 min (3,6 mm/h, pluie modérée) à l'échéance +10 min."""
+    return httpx.Response(200, text=_piaf_xml(0.3 if _piaf_step(request) == 600 else 0.0))
 
 
 def _make_client(
@@ -138,8 +148,8 @@ def test_unified_weather_merges_arome_arpege_and_meteofrance(tmp_path: Path) -> 
             return httpx.Response(200, json=_sample_open_meteo_payload())
         if "cartevigilance" in url:
             return httpx.Response(200, json=_sample_vigilance_payload())
-        if "paquet/pluie" in url:
-            return httpx.Response(200, json=_sample_nowcast_payload())
+        if "/pro/piaf/" in url:
+            return _piaf_response(request)
         return httpx.Response(404)
 
     with _make_client(tmp_path, handler) as client:
@@ -161,8 +171,10 @@ def test_unified_weather_merges_arome_arpege_and_meteofrance(tmp_path: Path) -> 
 
         # Pluie dans l'heure
         assert data["rain_nowcast"]["status"] == "fresh"
-        assert len(data["rain_nowcast"]["slices"]) == 2
+        assert data["rain_nowcast"]["source_model"] == "meteofrance-piaf"
+        assert len(data["rain_nowcast"]["slices"]) == 12
         assert data["rain_nowcast"]["slices"][1]["rain_level"] == 3
+        assert data["rain_nowcast"]["slices"][1]["rain_mm_h"] == 3.6
 
 
 def test_stale_while_revalidate_and_circuit_breaker_on_502(tmp_path: Path) -> None:
@@ -176,8 +188,8 @@ def test_stale_while_revalidate_and_circuit_breaker_on_502(tmp_path: Path) -> No
             if mf_should_fail:
                 return httpx.Response(502, text="Bad Gateway secret-mf-token-123")
             return httpx.Response(200, json=_sample_vigilance_payload())
-        if "paquet/pluie" in url:
-            return httpx.Response(200, json=_sample_nowcast_payload())
+        if "/pro/piaf/" in url:
+            return _piaf_response(request)
         return httpx.Response(404)
 
     with _make_client(tmp_path, handler) as client:
@@ -212,8 +224,8 @@ def test_compact_endpoint_under_4kb_for_esp32(tmp_path: Path) -> None:
             return httpx.Response(200, json=_sample_open_meteo_payload())
         if "cartevigilance" in url:
             return httpx.Response(200, json=_sample_vigilance_payload())
-        if "paquet/pluie" in url:
-            return httpx.Response(200, json=_sample_nowcast_payload())
+        if "/pro/piaf/" in url:
+            return _piaf_response(request)
         return httpx.Response(404)
 
     with _make_client(tmp_path, handler) as client:
@@ -349,11 +361,11 @@ def _sample_paquet_obs_geojson() -> list[dict[str, Any]]:
     ]
 
 
-def test_rain_nowcast_falls_back_to_arome_15m_when_paquet_pluie_fails(tmp_path: Path) -> None:
+def test_rain_nowcast_falls_back_to_arome_15m_when_piaf_fails(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        if "paquet/pluie" in url:
-            return httpx.Response(404)
+        if "/pro/piaf/" in url:
+            return httpx.Response(503)
         if "/v1/meteofrance" in url and "minutely_15" in url:
             return httpx.Response(200, json=_sample_arome_15m_payload())
         if "/v1/meteofrance" in url:
@@ -451,3 +463,95 @@ def test_without_mf_key_uses_arome_15m_nowcast_and_reports_health(tmp_path: Path
         assert now.json()["source_model"] == "meteofrance_arome_france_hd_15min"
 
 
+
+
+def test_piaf_helpers_run_candidates_parse_and_levels() -> None:
+    from datetime import UTC, datetime
+
+    from app.collectors.meteofrance import (
+        parse_piaf_point,
+        piaf_coverage_id,
+        piaf_run_candidates,
+        rain_slice_from_mm_5min,
+    )
+
+    now = datetime(2026, 11, 16, 20, 38, 12, tzinfo=UTC)
+    runs = piaf_run_candidates(now, publish_delay_minutes=10)
+    assert [r.strftime("%H:%M") for r in runs] == ["20:25", "20:20", "20:15"]
+    assert piaf_coverage_id(runs[0]) == (
+        "TOTAL_PRECIPITATION_RATE__GROUND_OR_WATER_SURFACE___2026-11-16T20.25.00Z_PT5M"
+    )
+
+    assert parse_piaf_point(_piaf_xml(0.53997802734375)) == pytest.approx(0.54, abs=1e-3)
+    assert parse_piaf_point(_piaf_xml("nan")) is None
+    assert parse_piaf_point(_piaf_xml(-1)) is None
+    assert parse_piaf_point("<mw:fault/>") is None
+
+    # mm sur 5 min -> mm/h (x12), seuils identiques au repli AROME 15 min
+    assert [rain_slice_from_mm_5min(now, v).rain_level for v in (0.0, 0.05, 0.3, 0.6)] == [1, 2, 3, 4]
+    assert rain_slice_from_mm_5min(now, 0.3).rain_mm_h == 3.6
+
+
+def test_piaf_skips_unpublished_run_queries_point_and_caches(tmp_path: Path) -> None:
+    piaf_requests: list[httpx.Request] = []
+    rejected_runs: set[str] = set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/pro/piaf/" in url:
+            piaf_requests.append(request)
+            coverage = request.url.params["coverageid"]
+            # Le run le plus récent n'est pas encore publié : le WCS répond 404
+            if not rejected_runs or coverage in rejected_runs:
+                rejected_runs.add(coverage)
+                return httpx.Response(404, text="<mw:fault/>")
+            return _piaf_response(request)
+        return httpx.Response(404)
+
+    with _make_client(tmp_path, handler) as client:
+        r1 = client.get("/v1/rain-nowcast", params={"lat": 43.6712, "lon": -1.4288})
+        assert r1.status_code == 200
+        body = r1.json()
+        assert body["status"] == "fresh"
+        assert body["source_model"] == "meteofrance-piaf"
+        assert len(body["slices"]) == 12
+        assert [s["rain_level"] for s in body["slices"][:3]] == [1, 3, 1]
+
+        # 1 run refusé + 12 échéances, hôte api.meteofrance.fr, en-tête apikey seul
+        assert len(piaf_requests) == 13
+        req = piaf_requests[-1]
+        assert req.url.host == "api.meteofrance.fr"
+        assert req.headers["apikey"] == "secret-mf-token-123"
+        assert "authorization" not in req.headers
+        subsets = req.url.params.get_list("subset")
+        assert "lat(43.67)" in subsets and "long(-1.43)" in subsets
+        steps = sorted(_piaf_step(r) for r in piaf_requests[1:])
+        assert steps == [300 * i for i in range(1, 13)]
+
+        # Les tranches suivent le run : +5 min, +10 min, …
+        from datetime import datetime
+
+        t0 = datetime.fromisoformat(body["slices"][0]["time"].replace("Z", "+00:00"))
+        t1 = datetime.fromisoformat(body["slices"][1]["time"].replace("Z", "+00:00"))
+        assert (t1 - t0).total_seconds() == 300
+
+        # Deuxième appel au même point : servi par le cache, aucune requête PIAF
+        r2 = client.get("/v1/rain-nowcast", params={"lat": 43.67, "lon": -1.43})
+        assert r2.json()["slices"] == body["slices"]
+        assert len(piaf_requests) == 13
+
+
+def test_piaf_unreadable_value_falls_back_to_arome(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/pro/piaf/" in url:
+            return httpx.Response(200, text=_piaf_xml("nan"))
+        if "/v1/meteofrance" in url and "minutely_15" in url:
+            return httpx.Response(200, json=_sample_arome_15m_payload())
+        return httpx.Response(404)
+
+    with _make_client(tmp_path, handler) as client:
+        body = client.get("/v1/rain-nowcast", params={"lat": 43.65, "lon": -1.45}).json()
+        assert body["source_model"] == "meteofrance_arome_france_hd_15min"
+        health = client.get("/v1/health").json()
+        assert "PIAF" in (health["sources"]["meteofrance-nowcast"]["last_error"] or "")
