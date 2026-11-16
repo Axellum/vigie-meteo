@@ -4,12 +4,13 @@ API météo résiliente et standardisée pour la France, conçue pour tourner su
 
 Elle remplace et fiabilise l'API officielle Météo-France en combinant :
 1. **Open-Meteo auto-hébergé (France uniquement)** : modèles **AROME HD** (~1,5 km, 0–48 h) et **ARPEGE Europe** (~11 km, J+2 à J+4) fusionnés en une seule série horaire continue.
-2. **Météo-France officielle (Portail API)** : uniquement pour les données exclusives (**Vigilances départementales** et **Pluie dans l'heure**), protégées par un cache persistant **SQLite WAL** (*Stale-While-Revalidate*) et un **Circuit Breaker**.
+2. **Météo-France officielle (Portail API)** : la **pluie dans l'heure PIAF** (pas de 5 min), protégée par un cache persistant **SQLite WAL** (*Stale-While-Revalidate*) et un **Circuit Breaker**.
+
+C'est la source météo interne de [Vigie](https://github.com/Axellum/vigie-api), qui reste la seule porte d'entrée (site, écrans, Home Assistant). Les **vigilances** et les **observations 6 min** de Météo-France sont lues par Vigie elle-même : elles ne passent plus par cette passerelle (retirées le 16/11/2026).
 
 ## Standards et normes appliqués
 - **OpenAPI 3.1** (`/docs`, `/redoc`, `/openapi.json`)
 - **RFC 9457** (`application/problem+json` pour toutes les erreurs HTTP)
-- **RFC 7946** (export GeoJSON sur `/v1/vigilances/geojson`)
 - **WMO 4677** (codes météo normalisés) & **ISO-8601 UTC**
 - **Aucune donnée inventée** : une information absente ou indisponible vaut `null`.
 
@@ -17,11 +18,9 @@ Elle remplace et fiabilise l'API officielle Météo-France en combinant :
 
 | Route | Usage |
 | :--- | :--- |
-| `GET /v1/weather?lat=48.85&lon=2.35&dept=75` | Endpoint unifié complet (actuel, pluie 1h, vigilance, horaire fusionné, journalier) |
-| `GET /v1/compact?lat=48.85&lon=2.35&dept=75` | Payload condensé (< 4 Ko) pour ESP32 / LVGL / écrans domotiques |
-| `GET /v1/vigilances?dept=75` | Vigilances officielles Météo-France (toute la France ou par département) |
-| `GET /v1/vigilances/geojson` | Vigilances au format GeoJSON (RFC 7946) |
-| `GET /v1/rain-nowcast?lat=48.85&lon=2.35` | Pluie dans l'heure (tranches 5–10 min) |
+| `GET /v1/weather?lat=48.85&lon=2.35` | Endpoint unifié (actuel, pluie 1h, horaire fusionné, journalier) |
+| `GET /v1/compact?lat=48.85&lon=2.35` | Payload condensé (< 4 Ko) pour ESP32 / LVGL / écrans domotiques |
+| `GET /v1/rain-nowcast?lat=48.85&lon=2.35` | Pluie dans l'heure PIAF (tranches de 5 min datées de leur fin ; repli AROME HD 15 min) : lue par Vigie |
 | `GET /v1/forecast?...` | Proxy 100 % compatible avec la signature Open-Meteo |
 | `GET /v1/health` | État de la base SQLite et des circuits breakers |
 

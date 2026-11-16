@@ -10,17 +10,12 @@ from fastapi.responses import JSONResponse
 
 from app import __version__
 from app.cache import CacheStore
-from app.collectors.meteofrance import (
-    MeteoFranceNowcastCollector,
-    MeteoFranceObservationsCollector,
-    MeteoFranceVigilanceCollector,
-)
+from app.collectors.meteofrance import MeteoFranceNowcastCollector
 from app.collectors.open_meteo import OpenMeteoCollector
 from app.config import Settings, get_settings, redact_secret
 from app.models import (
     CompactWeatherResponse,
     HealthResponse,
-    ObservationsResponse,
     ProblemDetail,
     RainNowcastBlock,
     SourceStatus,
@@ -44,17 +39,13 @@ def create_app(
         client = http_client or httpx.AsyncClient()
 
         om_collector = OpenMeteoCollector(client, cache, cfg)
-        vig_collector = MeteoFranceVigilanceCollector(client, cache, cfg)
         now_collector = MeteoFranceNowcastCollector(client, cache, cfg)
-        obs_collector = MeteoFranceObservationsCollector(client, cache, cfg)
-        service = WeatherAggregatorService(om_collector, vig_collector, now_collector, obs_collector)
+        service = WeatherAggregatorService(om_collector, now_collector)
 
         app_instance.state.settings = cfg
         app_instance.state.cache = cache
         app_instance.state.om_collector = om_collector
-        app_instance.state.vig_collector = vig_collector
         app_instance.state.now_collector = now_collector
-        app_instance.state.obs_collector = obs_collector
         app_instance.state.weather_service = service
 
         try:
@@ -69,7 +60,7 @@ def create_app(
         version=__version__,
         description=(
             "API météo résiliente pour la France : fusion Open-Meteo (AROME HD + ARPEGE) "
-            "et données officielles Météo-France (Vigilances + Pluie dans l'heure), "
+            "et pluie dans l'heure officielle Météo-France (PIAF), "
             "avec cache SQLite WAL et circuit breaker."
         ),
         lifespan=lifespan,
@@ -113,7 +104,7 @@ def create_app(
         db_ok = cache.ping()
 
         sources: dict[str, SourceStatus] = {}
-        for provider in ("open-meteo", "meteofrance-vigilance", "meteofrance-nowcast", "meteofrance-obs"):
+        for provider in ("open-meteo", "meteofrance-nowcast"):
             st = cache.get_provider_state(provider)
             if provider.startswith("meteofrance") and cfg.meteofrance_api_key is None:
                 status_val = "not_configured"
@@ -144,16 +135,11 @@ def create_app(
         response: Response,
         lat: float = Query(..., ge=-90.0, le=90.0, description="Latitude WGS84."),
         lon: float = Query(..., ge=-180.0, le=180.0, description="Longitude WGS84."),
-        dept: str | None = Query(default=None, min_length=2, max_length=3, description="Code département (ex: 75, 40, 2A)."),
         days: int = Query(default=4, ge=1, le=7, description="Nombre de jours de prévision (1 à 7)."),
-        include_obs: bool = Query(
-            default=False,
-            description="Si vrai, inclut l'observation sol 6 min DPPaquetObs v2 de la station la plus proche.",
-        ),
     ) -> UnifiedWeatherResponse:
-        """Retourne les prévisions fusionnées (AROME HD + ARPEGE), la pluie à 1h et la vigilance."""
+        """Retourne les prévisions fusionnées (AROME HD + ARPEGE) et la pluie à 1h."""
         service: WeatherAggregatorService = request.app.state.weather_service
-        result = await service.get_unified_weather(lat=lat, lon=lon, dept=dept, days=days, include_obs=include_obs)
+        result = await service.get_unified_weather(lat=lat, lon=lon, days=days)
         if result.sources["forecast"].status == "unavailable":
             raise HTTPException(status_code=503, detail="Source de prévision indisponible et aucun cache valide.")
         response.headers["Cache-Control"] = f"public, max-age={min(cfg.nowcast_ttl_seconds, 180)}"
@@ -165,65 +151,12 @@ def create_app(
         response: Response,
         lat: float = Query(..., ge=-90.0, le=90.0),
         lon: float = Query(..., ge=-180.0, le=180.0),
-        dept: str | None = Query(default=None, min_length=2, max_length=3),
     ) -> CompactWeatherResponse:
         """Payload ultra-léger (< 4 Ko) optimisé pour ESP32 / LVGL / écrans domotiques."""
         service: WeatherAggregatorService = request.app.state.weather_service
-        result = await service.get_compact_weather(lat=lat, lon=lon, dept=dept)
+        result = await service.get_compact_weather(lat=lat, lon=lon)
         response.headers["Cache-Control"] = "public, max-age=180"
         return result
-
-    @app.get("/v1/vigilances", tags=["Vigilances"])
-    async def get_vigilances(
-        request: Request,
-        dept: str | None = Query(default=None, min_length=2, max_length=3, description="Filtrer sur un département."),
-    ) -> dict[str, Any]:
-        """Retourne les vigilances officielles Météo-France (France entière ou par département)."""
-        collector: MeteoFranceVigilanceCollector = request.app.state.vig_collector
-        payload, status = await collector.get_all_vigilances()
-        if payload is None:
-            return {"status": status.status, "source": status.model_dump(), "departments": []}
-
-        if dept:
-            one = collector.parse_department(payload, dept)
-            return {
-                "status": status.status,
-                "source": status.model_dump(),
-                "departments": [one.model_dump()] if one else [],
-            }
-        all_depts = collector.parse_all_departments(payload)
-        return {
-            "status": status.status,
-            "source": status.model_dump(),
-            "departments": [d.model_dump() for d in all_depts],
-        }
-
-    @app.get("/v1/vigilances/geojson", tags=["Vigilances"])
-    async def get_vigilances_geojson(request: Request) -> dict[str, Any]:
-        """Exporte les vigilances départementales au format GeoJSON (RFC 7946)."""
-        collector: MeteoFranceVigilanceCollector = request.app.state.vig_collector
-        payload, status = await collector.get_all_vigilances()
-        if payload is None:
-            return {
-                "type": "FeatureCollection",
-                "metadata": {"status": status.status},
-                "features": [],
-            }
-        depts = collector.parse_all_departments(payload)
-        features = [
-            {
-                "type": "Feature",
-                "id": d.department,
-                "geometry": None,
-                "properties": d.model_dump(mode="json"),
-            }
-            for d in depts
-        ]
-        return {
-            "type": "FeatureCollection",
-            "metadata": {"status": status.status},
-            "features": features,
-        }
 
     @app.get("/v1/rain-nowcast", response_model=RainNowcastBlock, tags=["Météo"])
     async def get_rain_nowcast(
@@ -234,20 +167,6 @@ def create_app(
         """Retourne la pluie dans l'heure officielle ou le repli AROME HD 15 min."""
         service: WeatherAggregatorService = request.app.state.weather_service
         return await service.get_rain_nowcast(lat=lat, lon=lon)
-
-    @app.get("/v1/observations", response_model=ObservationsResponse, tags=["Météo"])
-    async def get_observations(
-        request: Request,
-        response: Response,
-        lat: float = Query(..., ge=-90.0, le=90.0, description="Latitude WGS84."),
-        lon: float = Query(..., ge=-180.0, le=180.0, description="Longitude WGS84."),
-        radius_km: float = Query(default=50.0, ge=1.0, le=200.0, description="Rayon maximal de recherche en km."),
-    ) -> ObservationsResponse:
-        """Retourne l'observation 6 min la plus proche via Météo-France `DPPaquetObs v2`."""
-        service: WeatherAggregatorService = request.app.state.weather_service
-        result = await service.get_nearest_observation(lat=lat, lon=lon, radius_km=radius_km)
-        response.headers["Cache-Control"] = f"public, max-age={cfg.obs_ttl_seconds}"
-        return result
 
     @app.get("/v1/forecast", tags=["Compatibilité Open-Meteo"])
     async def proxy_open_meteo_forecast(request: Request) -> dict[str, Any]:

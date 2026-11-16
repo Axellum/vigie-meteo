@@ -13,7 +13,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 FreshnessStatus = Literal["fresh", "stale", "unavailable", "not_configured"]
-VigilanceColor = Literal["green", "yellow", "orange", "red"]
 
 
 class ProblemDetail(BaseModel):
@@ -111,71 +110,11 @@ class RainNowcastBlock(BaseModel):
     )
 
 
-class VigilancePhenomenon(BaseModel):
-    """Phénomène de vigilance officiel (ex: Orages, Vent, Pluie-Inondation)."""
-
-    id: int | str
-    name: str
-    color: VigilanceColor
-    level: int = Field(..., ge=1, le=4, description="1=Vert, 2=Jaune, 3=Orange, 4=Rouge.")
-    start_time: datetime | None = None
-    end_time: datetime | None = None
-
-
-class VigilanceDepartment(BaseModel):
-    """État de vigilance officiel pour un département français."""
-
-    department: str = Field(..., description="Code département (ex: 75, 40, 2A).")
-    color: VigilanceColor
-    level: int = Field(..., ge=1, le=4)
-    phenomena: list[VigilancePhenomenon] = Field(default_factory=list)
-    issued_at: datetime | None = None
-    valid_until: datetime | None = None
-
-
-class VigilanceBlock(BaseModel):
-    """Bloc Vigilances avec statut de fraîcheur."""
-
-    status: FreshnessStatus
-    department: VigilanceDepartment | None = None
-
-
-class ObservationStation(BaseModel):
-    """Observation sol temps réel 6 minutes issue de Météo-France (DPPaquetObs v2)."""
-
-    station_id: str = Field(..., description="Identifiant INSEE de la station à 8 chiffres (`geo_id_insee`).")
-    latitude: float
-    longitude: float
-    distance_km: float
-    observed_at: datetime
-    temperature_c: float | None = None
-    dew_point_c: float | None = None
-    relative_humidity_pct: int | None = None
-    wind_speed_kmh: float | None = None
-    wind_direction_deg: int | None = None
-    wind_gusts_kmh: float | None = None
-    wind_gusts_direction_deg: int | None = None
-    precipitation_6m_mm: float | None = None
-    pressure_msl_hpa: float | None = None
-    visibility_m: int | None = None
-
-
-class ObservationsResponse(BaseModel):
-    """Réponse de `GET /v1/observations` (station Météo-France la plus proche)."""
-
-    latitude: float
-    longitude: float
-    radius_km: float
-    source: SourceStatus
-    station: ObservationStation | None = None
-
-
 class Attribution(BaseModel):
     """Mentions légales et crédits obligatoires des fournisseurs."""
 
     forecast: str = "Open-Meteo (CC BY 4.0) / Météo-France AROME & ARPEGE (Licence Ouverte Etalab 2.0)"
-    vigilance: str = "Météo-France (Licence Ouverte Etalab 2.0)"
-    observation: str = "Météo-France DPPaquetObs v2 (Licence Ouverte Etalab 2.0)"
+    rain_nowcast: str = "Météo-France PIAF (portail-api.meteofrance.fr)"
 
 
 class UnifiedWeatherResponse(BaseModel):
@@ -185,13 +124,10 @@ class UnifiedWeatherResponse(BaseModel):
     longitude: float
     snapped_latitude: float
     snapped_longitude: float
-    department: str | None = None
     timezone: str = "Europe/Paris"
     generated_at: datetime
     current: CurrentWeather | None = None
-    observation: ObservationStation | None = None
     rain_nowcast: RainNowcastBlock
-    vigilance: VigilanceBlock
     hourly: list[HourlyForecastPoint] = Field(default_factory=list)
     daily: list[DailyForecastPoint] = Field(default_factory=list)
     sources: dict[str, SourceStatus]
@@ -203,7 +139,6 @@ class CompactWeatherResponse(BaseModel):
 
     lat: float
     lon: float
-    dept: str | None = None
     ts: int = Field(..., description="Timestamp UNIX UTC.")
     temp_c: float | None = None
     feels_c: float | None = None
@@ -211,8 +146,6 @@ class CompactWeatherResponse(BaseModel):
     wind_kmh: float | None = None
     gust_kmh: float | None = None
     wmo: int | None = None
-    vig_lvl: int | None = Field(default=None, description="1=Vert, 2=Jaune, 3=Orange, 4=Rouge.")
-    vig_color: VigilanceColor | None = None
     rain_1h_max: int | None = Field(default=None, description="Niveau max pluie dans l'heure (1..4).")
     stale: bool = False
     next_hours: list[dict[str, Any]] = Field(default_factory=list, description="Prochaines 12h condensées.")
