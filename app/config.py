@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     piaf_publish_delay_minutes: int = Field(default=10, ge=0, le=60, alias="METEO_PIAF_PUBLISH_DELAY_MINUTES")
     piaf_ttl_seconds: int = Field(default=300, alias="METEO_PIAF_TTL_SECONDS")
     piaf_concurrency: int = Field(default=4, ge=1, le=12, alias="METEO_PIAF_CONCURRENCY")
+    # La carte PIAF d'un run (toute la France) reste servie, pendant qu'un run plus récent se télécharge en tâche de
+    # fond, tant qu'elle a moins de cet âge ; au-delà, la requête attend le téléchargement (ou bascule en repli).
+    piaf_grid_max_stale_seconds: int = Field(default=900, ge=60, alias="METEO_PIAF_GRID_MAX_STALE_SECONDS")
 
     # Durées de vie du cache (TTL en secondes) et fenêtre de tolérance "stale"
     forecast_ttl_seconds: int = Field(default=900, alias="METEO_FORECAST_TTL_SECONDS")

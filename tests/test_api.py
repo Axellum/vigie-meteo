@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from tests.piaf_grib import piaf_filled
 
 
 def _sample_open_meteo_payload() -> dict[str, Any]:
@@ -60,16 +61,6 @@ def _sample_open_meteo_payload() -> dict[str, Any]:
     }
 
 
-def _piaf_xml(value: float | str) -> str:
-    """Réponse GML d'un point PIAF, au format renvoyé par le WCS (vérifié le 16/11/2026)."""
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?><gmlcov:ReferenceableGridCoverage '
-        'xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:gmlcov="http://www.opengis.net/gmlcov/1.0">'
-        f"<gml:rangeSet><gml:DataBlock><gml:tupleList>  {value}  "
-        "</gml:tupleList></gml:DataBlock></gml:rangeSet></gmlcov:ReferenceableGridCoverage>"
-    )
-
-
 def _piaf_step(request: httpx.Request) -> int:
     subsets = request.url.params.get_list("subset")
     time_subset = next(s for s in subsets if s.startswith("time("))
@@ -77,8 +68,9 @@ def _piaf_step(request: httpx.Request) -> int:
 
 
 def _piaf_response(request: httpx.Request) -> httpx.Response:
-    """PIAF simulé : sec, sauf 0,3 mm en 5 min (3,6 mm/h, pluie modérée) à l'échéance +10 min."""
-    return httpx.Response(200, text=_piaf_xml(0.3 if _piaf_step(request) == 600 else 0.0))
+    """PIAF simulé (une carte GRIB2 de toute la France par échéance) : sec, sauf 0,3 mm en 5 min (3,6 mm/h, pluie
+    modérée) partout à l'échéance +10 min."""
+    return httpx.Response(200, content=piaf_filled(0.3 if _piaf_step(request) == 600 else 0.0))
 
 
 def _make_client(
@@ -162,6 +154,13 @@ def test_stale_while_revalidate_and_circuit_breaker_on_502(tmp_path: Path) -> No
             (time.time() - 600,),
         )
         client.app.state.cache._conn.commit()
+        # La carte PIAF en mémoire a vieilli elle aussi (une heure : des runs plus récents existent) ; il faut la
+        # recharger, et le WCS est en panne
+        from datetime import timedelta
+
+        piaf_run = client.app.state.now_collector._run
+        piaf_run.loaded_at = time.time() - 3600
+        piaf_run.run -= timedelta(hours=1)
 
         r2 = client.get("/v1/rain-nowcast", params={"lat": 48.85, "lon": 2.35})
         assert r2.status_code == 200
@@ -324,8 +323,8 @@ def test_piaf_helpers_run_candidates_parse_and_levels() -> None:
     from datetime import UTC, datetime
 
     from app.collectors.meteofrance import (
-        parse_piaf_point,
         piaf_coverage_id,
+        piaf_mm_5min,
         piaf_run_candidates,
         rain_slice_from_mm_5min,
     )
@@ -337,17 +336,17 @@ def test_piaf_helpers_run_candidates_parse_and_levels() -> None:
         "TOTAL_PRECIPITATION_RATE__GROUND_OR_WATER_SURFACE___2026-11-16T20.25.00Z_PT5M"
     )
 
-    assert parse_piaf_point(_piaf_xml(0.53997802734375)) == pytest.approx(0.54, abs=1e-3)
-    assert parse_piaf_point(_piaf_xml("nan")) is None
-    assert parse_piaf_point(_piaf_xml(-1)) is None
-    assert parse_piaf_point("<mw:fault/>") is None
+    assert piaf_mm_5min(0.53997802734375) == pytest.approx(0.54, abs=1e-3)
+    assert piaf_mm_5min(float("nan")) is None
+    assert piaf_mm_5min(-1.0) is None
+    assert piaf_mm_5min(600.0) is None
 
     # mm sur 5 min -> mm/h (x12), seuils identiques au repli AROME 15 min
     assert [rain_slice_from_mm_5min(now, v).rain_level for v in (0.0, 0.05, 0.3, 0.6)] == [1, 2, 3, 4]
     assert rain_slice_from_mm_5min(now, 0.3).rain_mm_h == 3.6
 
 
-def test_piaf_skips_unpublished_run_queries_point_and_caches(tmp_path: Path) -> None:
+def test_piaf_skips_unpublished_run_reads_the_map_and_caches(tmp_path: Path) -> None:
     piaf_requests: list[httpx.Request] = []
     rejected_runs: set[str] = set()
 
@@ -378,8 +377,10 @@ def test_piaf_skips_unpublished_run_queries_point_and_caches(tmp_path: Path) -> 
         assert req.url.host == "api.meteofrance.fr"
         assert req.headers["apikey"] == "secret-mf-token-123"
         assert "authorization" not in req.headers
+        # La carte entière (toute la France) en GRIB2 : aucun découpage par point dans la requête
         subsets = req.url.params.get_list("subset")
-        assert "lat(43.67)" in subsets and "long(-1.43)" in subsets
+        assert not any(s.startswith(("lat(", "long(")) for s in subsets)
+        assert req.url.params["format"] == "application/wmo-grib"
         steps = sorted(_piaf_step(r) for r in piaf_requests[1:])
         assert steps == [300 * i for i in range(1, 13)]
 
@@ -395,12 +396,19 @@ def test_piaf_skips_unpublished_run_queries_point_and_caches(tmp_path: Path) -> 
         assert r2.json()["slices"] == body["slices"]
         assert len(piaf_requests) == 13
 
+        # D'autres points du même run : lus dans la carte en mémoire, toujours aucune requête PIAF
+        for lat, lon in ((48.85, 2.35), (45.76, 4.84), (43.3, 5.37), (50.63, 3.06)):
+            other = client.get("/v1/rain-nowcast", params={"lat": lat, "lon": lon}).json()
+            assert other["source_model"] == "meteofrance-piaf"
+            assert [s["rain_level"] for s in other["slices"][:3]] == [1, 3, 1]
+        assert len(piaf_requests) == 13
+
 
 def test_piaf_unreadable_value_falls_back_to_arome(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/pro/piaf/" in url:
-            return httpx.Response(200, text=_piaf_xml("nan"))
+            return httpx.Response(200, content=piaf_filled(600.0))  # au-delà de 500 mm en 5 min : valeur rejetée
         if "/v1/meteofrance" in url and "minutely_15" in url:
             return httpx.Response(200, json=_sample_arome_15m_payload())
         return httpx.Response(404)

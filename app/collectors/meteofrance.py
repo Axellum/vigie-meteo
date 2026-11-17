@@ -3,26 +3,36 @@
 Les vigilances et les observations 6 min sont lues par Vigie elle-même (vigie-api) : elles ne passent plus par
 cette passerelle (retirées le 16/11/2026).
 
+PIAF est lu **par carte, pas par point** (17/11/2026) : chaque run (toutes les 5 min) est téléchargé une fois, une
+requête WCS par échéance pour toute la France (GRIB2, 3,5 Mo chacune), puis chaque point est lu dans la carte gardée
+en mémoire. Avant, chaque point coûtait une requête par échéance (~13 à 18) sur un quota de 50/min : Vigie devait se
+limiter à 8 points par 5 min. Le coût ne dépend plus du nombre de points.
+
 Protégé par cache SQLite WAL + Circuit Breaker pour absorber les erreurs 429/502
 du portail officiel Météo-France sans jamais faire échouer l'API cliente.
 """
 
 import asyncio
+import logging
 import math
-import re
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 
+from app.cache import CacheStore
 from app.collectors.base import ResilientCollector, snap_coord
-from app.config import redact_secret
+from app.collectors.grib2 import LatLonGrid, decode_latlon_simple
+from app.config import Settings, redact_secret
 from app.models import (
     RainNowcastBlock,
     RainNowcastSlice,
     SourceStatus,
 )
+
+log = logging.getLogger(__name__)
 
 
 def _parse_dt(raw: str | int | float | None) -> datetime | None:
@@ -60,8 +70,8 @@ def _opt_float(val: Any) -> float | None:
 
 PIAF_SOURCE_MODEL = "meteofrance-piaf"
 PIAF_STEP_SECONDS = 300
+PIAF_FORMAT = "application/wmo-grib"
 _PIAF_COVERAGE = "TOTAL_PRECIPITATION_RATE__GROUND_OR_WATER_SURFACE___{run}_PT5M"
-_PIAF_TUPLE_RE = re.compile(r"<gml:tupleList>\s*([^<]*?)\s*</gml:tupleList>")
 
 
 def piaf_run_candidates(now: datetime, publish_delay_minutes: int, count: int = 3) -> list[datetime]:
@@ -76,18 +86,12 @@ def piaf_coverage_id(run: datetime) -> str:
     return _PIAF_COVERAGE.format(run=run.astimezone(UTC).strftime("%Y-%m-%dT%H.%M.%SZ"))
 
 
-def parse_piaf_point(text: str) -> float | None:
-    """Lit la valeur d'un point PIAF (GML `tupleList`) : cumul en mm sur 5 min, ou None si absente/invalide."""
-    match = _PIAF_TUPLE_RE.search(text)
-    if match is None:
+def piaf_mm_5min(value: float) -> float | None:
+    """Un cumul PIAF de 5 min lu dans la carte, ou None s'il est absent ou invalide."""
+    v = _opt_float(value)
+    if v is None or math.isnan(v) or v < 0.0 or v > 500.0:
         return None
-    parts = match.group(1).split()
-    if not parts:
-        return None
-    value = _opt_float(parts[0])
-    if value is None or math.isnan(value) or value < 0.0 or value > 500.0:
-        return None
-    return value
+    return v
 
 
 def rain_slice_from_mm_5min(at: datetime, mm_5min: float) -> RainNowcastSlice:
@@ -104,14 +108,37 @@ def rain_slice_from_mm_5min(at: datetime, mm_5min: float) -> RainNowcastSlice:
     return RainNowcastSlice(time=at, rain_level=level, rain_label=label, rain_mm_h=mm_h)
 
 
-class MeteoFranceNowcastCollector(_MeteoFranceAuthCollector):
-    """Pluie dans l'heure officielle : PIAF, pas de 5 min (une requête WCS par échéance).
+@dataclass
+class PiafRun:
+    """Les cartes d'un run PIAF : `steps[k]` = cumul (mm) des 5 min qui finissent à `run + (k+1) x 5 min`."""
 
-    Le résultat d'un point est mis en cache `piaf_ttl_seconds` (un run toutes les 5 min) :
-    ~13 requêtes par point et par run, sous le quota de 50/min de l'abonnement.
-    """
+    run: datetime
+    steps: list[LatLonGrid]
+    loaded_at: float = field(default_factory=time.time)
+
+    def point(self, lat: float, lon: float) -> list[float] | None:
+        """Les cumuls d'un point, échéance par échéance, ou None s'il est hors de la carte."""
+        idx = self.steps[0].index(lat, lon)
+        if idx is None:
+            return None
+        j, i = idx
+        return [float(grid.values[j, i]) for grid in self.steps]
+
+
+class PiafOutsideError(LookupError):
+    """Le point est hors de la carte PIAF (France métropolitaine) : ce n'est pas une panne de la source."""
+
+
+class MeteoFranceNowcastCollector(_MeteoFranceAuthCollector):
+    """Pluie dans l'heure officielle : PIAF, pas de 5 min, lue dans la carte du dernier run."""
 
     provider_name = "meteofrance-nowcast"
+
+    def __init__(self, client: httpx.AsyncClient, cache: CacheStore, settings: Settings) -> None:
+        super().__init__(client, cache, settings)
+        self._run: PiafRun | None = None
+        self._lock = asyncio.Lock()
+        self._refresh: asyncio.Task[None] | None = None
 
     async def get_rain_nowcast(
         self,
@@ -141,7 +168,11 @@ class MeteoFranceNowcastCollector(_MeteoFranceAuthCollector):
             return self._block(payload, status)
 
         try:
-            slices = await self._fetch_piaf(s_lat, s_lon, headers, now or datetime.now(tz=UTC))
+            piaf = await self._current_run(headers, now or datetime.now(tz=UTC))
+            slices = self._slices(piaf, s_lat, s_lon)
+        except PiafOutsideError:
+            status = SourceStatus(status="unavailable", provider=self.provider_name, last_error="hors de la zone PIAF")
+            return RainNowcastBlock(status="unavailable", slices=[]), status
         except (httpx.HTTPError, ValueError) as exc:
             err_msg = redact_secret(str(exc), self._settings)
             self._cache.record_failure(
@@ -167,22 +198,88 @@ class MeteoFranceNowcastCollector(_MeteoFranceAuthCollector):
             source_model=PIAF_SOURCE_MODEL if slices else None,
         ), status
 
-    async def _get_point(
-        self,
-        run: datetime,
-        step_seconds: int,
-        lat: float,
-        lon: float,
-        headers: dict[str, str],
-    ) -> httpx.Response:
+    @staticmethod
+    def _slices(piaf: PiafRun, lat: float, lon: float) -> list[RainNowcastSlice]:
+        values = piaf.point(lat, lon)
+        if values is None:
+            raise PiafOutsideError(f"({lat}, {lon}) hors de la carte PIAF")
+        slices: list[RainNowcastSlice] = []
+        for k, raw in enumerate(values, start=1):
+            mm = piaf_mm_5min(raw)
+            if mm is None:
+                raise ValueError(f"valeur PIAF illisible pour le run {piaf_coverage_id(piaf.run)}")
+            slices.append(rain_slice_from_mm_5min(piaf.run + timedelta(seconds=PIAF_STEP_SECONDS * k), mm))
+        return slices
+
+    async def _current_run(self, headers: dict[str, str], now: datetime) -> PiafRun:
+        """La carte à servir : celle en mémoire si elle est récente, sinon celle du dernier run publié.
+
+        Une carte de moins de `piaf_ttl_seconds` (depuis son chargement) est servie telle quelle. Plus vieille mais de
+        moins de `piaf_grid_max_stale_seconds`, elle est servie pendant qu'un run plus récent se télécharge en tâche
+        de fond. Sans carte, ou trop vieille, la requête attend le téléchargement.
+        """
+        current = self._run
+        if current is not None:
+            age = time.time() - current.loaded_at
+            if age < self._settings.piaf_ttl_seconds:
+                return current
+            if age < self._settings.piaf_grid_max_stale_seconds:
+                if self._refresh is None or self._refresh.done():
+                    self._refresh = asyncio.create_task(self._refresh_quietly(headers, now))
+                return current
+        return await self._load(headers, now, seen=current)
+
+    async def _refresh_quietly(self, headers: dict[str, str], now: datetime) -> None:
+        try:
+            await self._load(headers, now, seen=self._run)
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("rafraîchissement PIAF en échec : %s", redact_secret(str(exc), self._settings))
+
+    async def _load(self, headers: dict[str, str], now: datetime, seen: PiafRun | None) -> PiafRun:
+        """Télécharge le dernier run publié (une requête par échéance), une seule fois à la fois."""
+        async with self._lock:
+            if self._run is not seen and self._run is not None:
+                return self._run  # chargé par une autre requête pendant l'attente du verrou
+            run, first = await self._first_step(headers, now)
+            if self._run is not None and self._run.run == run:
+                self._run.loaded_at = time.time()  # pas de run plus récent publié : on regardera au prochain délai
+                return self._run
+            sem = asyncio.Semaphore(self._settings.piaf_concurrency)
+
+            async def step(seconds: int) -> LatLonGrid:
+                async with sem:
+                    resp = await self._get_step(run, seconds, headers)
+                    resp.raise_for_status()
+                    return decode_latlon_simple(resp.content)
+
+            seconds = [PIAF_STEP_SECONDS * i for i in range(2, self._settings.piaf_steps + 1)]
+            rest = await asyncio.gather(*(step(s) for s in seconds))
+            grids = [first, *rest]
+            shape = first.values.shape
+            if any(g.values.shape != shape or g.lat0 != first.lat0 or g.lon0 != first.lon0 for g in grids):
+                raise ValueError(f"cartes PIAF de géométries différentes dans le run {piaf_coverage_id(run)}")
+            self._run = PiafRun(run=run, steps=grids)
+            return self._run
+
+    async def _first_step(self, headers: dict[str, str], now: datetime) -> tuple[datetime, LatLonGrid]:
+        """Le dernier run publié et sa première échéance (sans le catalogue de 2 Mo)."""
+        for candidate in piaf_run_candidates(now, self._settings.piaf_publish_delay_minutes):
+            if self._run is not None and candidate <= self._run.run:
+                return self._run.run, self._run.steps[0]  # rien de plus récent que la carte en mémoire
+            resp = await self._get_step(candidate, PIAF_STEP_SECONDS, headers)
+            if resp.status_code in (400, 404):
+                continue  # run pas encore publié (ou déjà retiré) : essayer le précédent
+            resp.raise_for_status()
+            return candidate, decode_latlon_simple(resp.content)
+        raise ValueError("aucun run PIAF publié parmi les candidats")
+
+    async def _get_step(self, run: datetime, step_seconds: int, headers: dict[str, str]) -> httpx.Response:
         params = [
             ("service", "WCS"),
             ("version", "2.0.1"),
             ("coverageid", piaf_coverage_id(run)),
             ("subset", f"time({step_seconds})"),
-            ("subset", f"lat({lat})"),
-            ("subset", f"long({lon})"),
-            ("format", "image/tiff"),
+            ("format", PIAF_FORMAT),
         ]
         req_headers = {"User-Agent": self._settings.user_agent, **headers}
         return await self._client.get(
@@ -191,45 +288,3 @@ class MeteoFranceNowcastCollector(_MeteoFranceAuthCollector):
             headers=req_headers,
             timeout=self._settings.http_timeout_seconds,
         )
-
-    async def _fetch_piaf(
-        self,
-        lat: float,
-        lon: float,
-        headers: dict[str, str],
-        now: datetime,
-    ) -> list[RainNowcastSlice]:
-        """Trouve le dernier run publié (sans le catalogue de 2 Mo), puis lit chaque échéance."""
-        run: datetime | None = None
-        first: float | None = None
-        for candidate in piaf_run_candidates(now, self._settings.piaf_publish_delay_minutes):
-            resp = await self._get_point(candidate, PIAF_STEP_SECONDS, lat, lon, headers)
-            if resp.status_code in (400, 404):
-                continue  # run pas encore publié (ou déjà retiré) : essayer le précédent
-            resp.raise_for_status()
-            first = parse_piaf_point(resp.text)
-            run = candidate
-            break
-        if run is None:
-            raise ValueError("aucun run PIAF publié parmi les candidats")
-
-        sem = asyncio.Semaphore(self._settings.piaf_concurrency)
-
-        async def read_step(step_seconds: int) -> float | None:
-            async with sem:
-                resp = await self._get_point(run, step_seconds, lat, lon, headers)
-                resp.raise_for_status()
-                return parse_piaf_point(resp.text)
-
-        steps = [PIAF_STEP_SECONDS * i for i in range(2, self._settings.piaf_steps + 1)]
-        rest = await asyncio.gather(*(read_step(s) for s in steps))
-        values: list[float] = []
-        for raw in (first, *rest):
-            if raw is None:
-                raise ValueError(f"valeur PIAF illisible pour le run {piaf_coverage_id(run)}")
-            values.append(raw)
-
-        return [
-            rain_slice_from_mm_5min(run + timedelta(seconds=PIAF_STEP_SECONDS * i), v)
-            for i, v in enumerate(values, start=1)
-        ]
