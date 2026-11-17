@@ -68,7 +68,8 @@ services:
     # Sur Oracle, la chaîne DOCKER-USER bloque l'interface publique et autorise WireGuard (wg0)
     ports:
       - "8000:8000"
+    # PIAF : 125 Mo de carte par processus (2), pic mesuré 178 Mo pendant un chargement (17/11/2026)
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 1G
