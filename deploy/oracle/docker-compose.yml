@@ -63,6 +63,10 @@ services:
     environment:
       METEO_DB_PATH: /data/meteo_cache.db
       OPEN_METEO_BASE_URL: http://open-meteo:8080
+      # glibc garde sinon les cartes PIAF libérées (480 Mo par processus mesurés le 17/11/2026 au lieu de ~175) :
+      # au-delà de 1 Mo, un bloc est alloué par mmap et rendu au système dès qu'il est libéré.
+      MALLOC_MMAP_THRESHOLD_: "1048576"
+      MALLOC_ARENA_MAX: "2"
     volumes:
       - meteo_api_data:/data
     # Sur Oracle, la chaîne DOCKER-USER bloque l'interface publique et autorise WireGuard (wg0)
