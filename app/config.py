@@ -62,6 +62,23 @@ class Settings(BaseSettings):
     radar_dir: str | None = Field(default=None, alias="METEO_RADAR_DIR")  # défaut : `radar/` à côté de la base SQLite
     radar_keep_minutes: int = Field(default=180, ge=15, le=1440, alias="METEO_RADAR_KEEP_MINUTES")
 
+    # AROME-PI (prévision immédiate, WCS `aromepi/1.0`) : grêle, rafales, visibilité et type de précipitation, 24 échéances de 15 min.
+    # Un run par heure, publié ~20 min après son heure (relevé le 18/11/2026) ; une échéance par requête (96 requêtes par run).
+    aromepi_enabled: bool = Field(default=True, alias="METEO_AROMEPI_ENABLED")
+    meteofrance_aromepi_url: str = Field(
+        default="https://public-api.meteofrance.fr/public/aromepi/1.0/wcs/MF-NWP-HIGHRES-AROMEPI-001-FRANCE-WCS",
+        alias="METEOFRANCE_AROMEPI_URL",
+    )
+    aromepi_dir: str | None = Field(default=None, alias="METEO_AROMEPI_DIR")  # défaut : `aromepi/` à côté de la base SQLite
+    aromepi_publish_delay_minutes: int = Field(default=20, ge=0, le=120, alias="METEO_AROMEPI_PUBLISH_DELAY_MINUTES")
+    # Le quota du portail est de 50 requêtes par minute pour toute la clé (PIAF et le radar en prennent aussi) : 20 par minute et par
+    # processus, un seul des deux processus télécharge (verrou de fichier).
+    aromepi_requests_per_minute: int = Field(default=20, ge=1, le=40, alias="METEO_AROMEPI_REQUESTS_PER_MINUTE")
+    aromepi_concurrency: int = Field(default=2, ge=1, le=8, alias="METEO_AROMEPI_CONCURRENCY")
+    aromepi_keep_runs: int = Field(default=3, ge=1, le=24, alias="METEO_AROMEPI_KEEP_RUNS")
+    # Au-delà de cet âge le dernier run n'est plus servi (il ne couvrirait plus que quelques échéances à venir).
+    aromepi_max_age_minutes: int = Field(default=180, ge=30, le=1440, alias="METEO_AROMEPI_MAX_AGE_MINUTES")
+
     # Durées de vie du cache (TTL en secondes) et fenêtre de tolérance "stale"
     forecast_ttl_seconds: int = Field(default=900, alias="METEO_FORECAST_TTL_SECONDS")
     nowcast_ttl_seconds: int = Field(default=180, alias="METEO_NOWCAST_TTL_SECONDS")

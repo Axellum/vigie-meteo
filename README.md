@@ -22,6 +22,7 @@ C'est la source météo interne de [Vigie](https://github.com/Axellum/vigie-api)
 | `GET /v1/compact?lat=48.85&lon=2.35` | Payload condensé (< 4 Ko) pour ESP32 / LVGL / écrans domotiques |
 | `GET /v1/rain-nowcast?lat=48.85&lon=2.35` | Pluie dans l'heure PIAF (tranches de 5 min datées de leur fin ; repli AROME HD 15 min) : lue par Vigie |
 | `GET /v1/forecast?...` | Proxy 100 % compatible avec la signature Open-Meteo ; avec `models=meteofrance_seamless` : AROME HD puis ARPEGE Europe, variable par variable (lu par Vigie pour la météo de la France) ; en-têtes `X-Cache-Status` (`fresh` ou `stale`) et `X-Cache-Age` |
+| `GET /v1/shortterm?lat=48.85&lon=2.35` | Grêle, rafales, visibilité et type de précipitation des prochaines heures (jusqu'à 6 h, pas de 15 min) du modèle AROME-PI de Météo-France : une carte de la France par run en mémoire, 404 hors de la métropole et de la Corse, 503 sans run récent : lue par Vigie |
 | `GET /v1/radar/frames` | Images de la mosaïque radar Météo-France (lame d'eau, métropole, une toutes les 5 min, 3 h gardées) : dates, zone couverte, modèle de chemin des tuiles |
 | `GET /v1/radar/tiles/{epoch}/{z}/{x}/{y}.png` | Tuile PNG 256 px (Web Mercator, zooms 3 à 10) d'une image radar, classes d'intensité en couleurs, transparente sans pluie ; l'adresse porte la date de l'image : réponse immuable |
 | `GET /v1/health` | État de la base SQLite et des circuits breakers |
@@ -33,6 +34,18 @@ dès qu'une nouvelle est publiée (date lue dans un petit document JSON avant le
 de la base, ~230 Ko par image, `METEO_RADAR_KEEP_MINUTES`, 180 par défaut) et les tuiles sont calculées à la demande
 (`app/radar_grid.py` : projection stéréographique polaire écrite en numpy, pas de pyproj). `METEO_RADAR_ENABLED=0` coupe la tâche.
 Source : Météo-France, Licence Ouverte 2.0 (jeu « Package Radar » de data.gouv.fr) ; crédit dans `/v1/radar/frames`.
+
+### AROME-PI (grêle, rafales, visibilité, type de précipitation)
+
+`aromepi/1.0` (WCS `MF-NWP-HIGHRES-AROMEPI-001-FRANCE-WCS`) : un run par heure, publié échéance après échéance, complet une vingtaine de minutes
+après son heure (relevé le 18/11/2026) ; 24 échéances de 15 minutes (jusqu'à +6 h). Le WCS ne rend **qu'une échéance par requête** : un run coûte
+4 produits x 24 échéances = 96 requêtes de la carte de la France (3,5 Mo chacune), espacées (`METEO_AROMEPI_REQUESTS_PER_MINUTE`, 20 par défaut)
+pour laisser le quota de 50 par minute à PIAF et au radar. Chaque carte est réduite aussitôt à des blocs de 4 x 4 nœuds (0,04°, le pire du bloc :
+maximum pour les rafales et la grêle, minimum pour la visibilité, nœud central pour le type de précipitation sauf verglas ou grêle qui l'emportent),
+la grille d'un run tient dans 15 Mo ; les 3 derniers runs complets sont gardés sur disque (`aromepi/` à côté de la base) et un verrou de fichier
+fait télécharger un seul des deux processus. Un run incomplet n'est jamais servi. `METEO_AROMEPI_ENABLED=0` coupe la tâche.
+Mesure contre les stations au sol : `python tools/measure_aromepi.py --day AAAA-MM-JJ --hours 2-8` (clé dans `VIGIE_METEOFRANCE_API_KEY`).
+Source : Météo-France, modèle AROME-PI ; licence de ces données non vérifiée (voir l'ADR 0031 de vigie-api).
 
 ## Développement & Tests locaux (Windows PowerShell)
 

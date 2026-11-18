@@ -139,6 +139,34 @@ class RadarFramesResponse(BaseModel):
     frames: list[RadarFrameInfo]
 
 
+class ShortTermStep(BaseModel):
+    """Une échéance de 15 minutes de la prévision immédiate AROME-PI : ce que le modèle prévoit sur les 15 minutes qui finissent à `time`."""
+
+    time: datetime = Field(..., description="Fin des 15 minutes (UTC).")
+    wind_gust_kmh: int = Field(..., description="Rafale maximale des 15 minutes à 10 m (km/h), le maximum du bloc de 0,04° autour du point.")
+    hail_kg_m2: float = Field(
+        ...,
+        description="Diagnostic de grêle AROME (kg/m2, maximum de l'intervalle, maximum du bloc). Météo-France : de 8 à 16 = grésil, 16 et plus = grêle.",
+    )
+    visibility_m: int = Field(..., description="Visibilité minimale des 15 minutes (m), plafonnée à 20 000, minimum du bloc.")
+    precip_type: int = Field(
+        ...,
+        description="Type de précipitation le plus grave des 15 minutes : code de la table 4.201 de l'OMM (0 aucune, 1 pluie, 3 verglaçante, "
+        "5 neige sèche, 6 neige humide, 7 pluie et neige, 8 granules de glace, 9 grésil, 10 grêle, 11 bruine, 12 bruine verglaçante) "
+        "ou code local de Météo-France (193 neige collante, 201 à 213 : la même chose, « intermittent »).",
+    )
+
+
+class ShortTermResponse(BaseModel):
+    """La prévision immédiate AROME-PI d'un point (`GET /v1/shortterm`)."""
+
+    source_model: str
+    attribution: str
+    run: datetime = Field(..., description="Heure du run AROME-PI (UTC).")
+    interval_minutes: int = 15
+    steps: list[ShortTermStep] = Field(..., description="Les échéances qui ne sont pas encore entièrement passées, de la plus proche à la plus lointaine.")
+
+
 class Attribution(BaseModel):
     """Mentions légales et crédits obligatoires des fournisseurs."""
 
