@@ -206,6 +206,8 @@ def test_vigilance_and_observation_routes_are_gone(tmp_path: Path) -> None:
             "meteofrance-radar",
             "meteofrance-aromepi",
             "meteofrance-aromeom",
+            "meteofrance-dpclim",
+            "meteofrance-forests",
             "meteofrance-pearome",
             "meteofrance-pearp",
         }

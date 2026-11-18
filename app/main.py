@@ -23,6 +23,9 @@ from app.collectors.aromeom import AromeOmCollector
 from app.collectors.aromepi import ATTRIBUTION as AROMEPI_ATTRIBUTION
 from app.collectors.aromepi import SOURCE_MODEL as AROMEPI_SOURCE_MODEL
 from app.collectors.aromepi import AromePiCollector, AromePiStore
+from app.collectors.dpclim import ATTRIBUTION as DPCLIM_ATTRIBUTION
+from app.collectors.dpclim import SOURCE_MODEL as DPCLIM_SOURCE_MODEL
+from app.collectors.dpclim import BusyError, StationDailyCollector, UpstreamError
 from app.collectors.ensemble import (
     AROME_ATTRIBUTION,
     AROME_SOURCE_MODEL,
@@ -33,6 +36,9 @@ from app.collectors.ensemble import (
     PeArpegeCollector,
     ProbabilityStore,
 )
+from app.collectors.forests import ATTRIBUTION as FORESTS_ATTRIBUTION
+from app.collectors.forests import SOURCE_MODEL as FORESTS_SOURCE_MODEL
+from app.collectors.forests import ForestsCollector
 from app.collectors.meteofrance import MeteoFranceNowcastCollector
 from app.collectors.open_meteo import OpenMeteoCollector
 from app.collectors.radar import ATTRIBUTION as RADAR_ATTRIBUTION
@@ -42,6 +48,8 @@ from app.config import Settings, get_settings, redact_secret
 from app.models import (
     CompactWeatherResponse,
     EnsembleBlock,
+    ForestDepartment,
+    ForestsResponse,
     HealthResponse,
     OverseasResponse,
     OverseasStep,
@@ -55,6 +63,7 @@ from app.models import (
     ShortTermResponse,
     ShortTermStep,
     SourceStatus,
+    StationDailyResponse,
     UnifiedWeatherResponse,
 )
 from app.radar_grid import BOUNDS, MAX_ZOOM, MIN_ZOOM, legend, tile_png
@@ -102,6 +111,12 @@ def create_app(
         app_instance.state.aromeom = aromeom
         aromeom_task = asyncio.create_task(aromeom.run_forever()) if aromeom.enabled() and own_client else None
 
+        dpclim = StationDailyCollector(client, cache, cfg)
+        app_instance.state.dpclim = dpclim
+        forests = ForestsCollector(client, cache, cfg)
+        app_instance.state.forests = forests
+        forests_task = asyncio.create_task(forests.run_forever()) if forests.enabled() and own_client else None
+
         pearome_dir = Path(cfg.pearome_dir) if cfg.pearome_dir else Path(cfg.db_path).resolve().parent / "pearome"
         pearome = PeAromeCollector(client, ProbabilityStore(pearome_dir, keep_runs=cfg.pearome_keep_runs), cfg)
         app_instance.state.pearome = pearome
@@ -114,7 +129,7 @@ def create_app(
         try:
             yield
         finally:
-            for task in (pearome_task, pearp_task, aromeom_task):
+            for task in (pearome_task, pearp_task, aromeom_task, forests_task):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -244,6 +259,32 @@ def create_app(
             updated_at=om_run,
             age_seconds=None if om_run is None else max(0, int((datetime.now(UTC) - om_run).total_seconds())),
             last_error=aromeom.last_error,
+        )
+
+        dpclim_state = cache.get_provider_state("meteofrance-dpclim")
+        dpclim_collector: StationDailyCollector = request.app.state.dpclim
+        if not dpclim_collector.enabled():
+            dpclim_status = "not_configured"
+        elif dpclim_state["circuit_open"]:
+            dpclim_status = "stale"
+        else:
+            dpclim_status = "fresh" if dpclim_state["last_success_at"] else "unavailable"
+        sources["meteofrance-dpclim"] = SourceStatus(
+            status=dpclim_status,
+            provider="meteofrance-dpclim",
+            updated_at=dpclim_state["last_success_at"],
+            circuit_open=dpclim_state["circuit_open"],
+            last_error=dpclim_state["last_error"],
+        )
+
+        forests_collector: ForestsCollector = request.app.state.forests
+        forests_status, forests_checked = forests_collector.health()
+        sources["meteofrance-forests"] = SourceStatus(
+            status=forests_status,
+            provider="meteofrance-forests",
+            updated_at=datetime.fromtimestamp(forests_checked, tz=UTC) if forests_checked is not None else None,
+            age_seconds=None if forests_checked is None else max(0, int(datetime.now(UTC).timestamp() - forests_checked)),
+            last_error=forests_collector.last_error,
         )
 
         for state_name, provider, max_age in (
@@ -388,6 +429,58 @@ def create_app(
             run=runs[0].run,
             nearest_node={"lat": node[0], "lon": node[1]},
             steps=steps,
+        )
+
+    @app.get("/v1/station-daily", response_model=StationDailyResponse, tags=["Climat"])
+    async def get_station_daily(
+        request: Request,
+        response: Response,
+        station: str = Query(..., pattern=r"^\d{8}$", description="Numéro Météo-France de la station (8 chiffres), par exemple celui d'une fiche climatologique."),
+        days: int = Query(7, ge=1, le=14),
+    ) -> StationDailyResponse:
+        """Les derniers jours mesurés par une station (température minimale et maximale, pluie, vent moyen et rafale), depuis les relevés quotidiens de Météo-France (DPClim).
+
+        Hier n'est disponible qu'après 11 h 30 UTC. Le portail est interrogé une fois par station et par jour au plus. 503 si le portail ne répond pas
+        ou si trop de commandes attendent ; une station sans mesure donne `days` vide."""
+        collector: StationDailyCollector = request.app.state.dpclim
+        if not collector.enabled():
+            raise HTTPException(status_code=503, detail="Relevés de stations non configurés.")
+        try:
+            rows, last, fetched = await collector.daily(station, days)
+        except BusyError as exc:
+            raise HTTPException(status_code=503, detail="Trop de demandes de relevés en attente, réessayer plus tard.", headers={"Retry-After": "30"}) from exc
+        except UpstreamError as exc:
+            raise HTTPException(status_code=503, detail="Relevés de Météo-France indisponibles.") from exc
+        response.headers["Cache-Control"] = "public, max-age=3600"
+        return StationDailyResponse(
+            source_model=DPCLIM_SOURCE_MODEL, attribution=DPCLIM_ATTRIBUTION, station=station, last_day=last, fetched_at=fetched, days=rows
+        )
+
+    @app.get("/v1/forests", response_model=ForestsResponse, tags=["Météo"])
+    async def get_forests(
+        request: Request,
+        response: Response,
+        department: str | None = Query(None, pattern=r"^(\d{2}|2A|2B)$", description="Code du département (`13`, `2A`...) ; absent = tous."),
+    ) -> ForestsResponse:
+        """La Météo des forêts (danger de feux de forêt, niveaux 1 à 4 pour J+1 et J+2) : `status` vaut `available` quand Météo-France publie (de juin à septembre), `out_of_season` sinon."""
+        collector: ForestsCollector = request.app.state.forests
+        if not collector.enabled():
+            raise HTTPException(status_code=503, detail="Météo des forêts non configurée.")
+        latest = collector.latest()
+        if latest is None:
+            raise HTTPException(status_code=503, detail="Météo des forêts pas encore lue.")
+        payload, checked = latest
+        departments = [ForestDepartment.model_validate(raw) for raw in payload["departments"]]
+        if department is not None:
+            departments = [d for d in departments if d.department == department]
+        response.headers["Cache-Control"] = "public, max-age=600"
+        return ForestsResponse(
+            source_model=FORESTS_SOURCE_MODEL,
+            attribution=FORESTS_ATTRIBUTION,
+            status=payload["state"],
+            reference_time=payload.get("reference_time"),
+            checked_at=datetime.fromtimestamp(checked, tz=UTC),
+            departments=departments,
         )
 
     @app.get("/v1/probabilities", response_model=ProbabilitiesResponse, tags=["Météo"])

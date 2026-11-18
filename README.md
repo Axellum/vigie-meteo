@@ -24,6 +24,8 @@ C'est la source météo interne de [Vigie](https://github.com/Axellum/vigie-api)
 | `GET /v1/forecast?...` | Proxy 100 % compatible avec la signature Open-Meteo ; avec `models=meteofrance_seamless` : AROME HD puis ARPEGE Europe, variable par variable (lu par Vigie pour la météo de la France) ; en-têtes `X-Cache-Status` (`fresh` ou `stale`) et `X-Cache-Age` |
 | `GET /v1/shortterm?lat=48.85&lon=2.35` | Grêle, rafales, visibilité et type de précipitation des prochaines heures (jusqu'à 6 h, pas de 15 min) du modèle AROME-PI de Météo-France : une carte de la France par run en mémoire, 404 hors de la métropole et de la Corse, 503 sans run récent : lue par Vigie |
 | `GET /v1/overseas?lat=14.6&lon=-61.0` | Prévision horaire AROME-OM de Météo-France pour un point d'outre-mer (température, humidité, vent, rafales, pression, nébulosité, pluie ; jusqu'à +48 h ; deux runs recollés) : 404 hors des fenêtres servies, 503 sans run récent : lue par Vigie |
+| `GET /v1/station-daily?station=59343001&days=7` | Derniers jours mesurés par une station Météo-France (température minimale et maximale, pluie, vent moyen, rafale ; DPClim) : une commande par station et par jour au plus, hier après 11 h 30 UTC, 503 si le portail ne répond pas : lue par Vigie |
+| `GET /v1/forests?department=11` | Météo des forêts (danger de feux de forêt par département, niveaux 1 à 4, J+1 et J+2) : `status` `available` de juin à septembre, `out_of_season` sinon : lue par Vigie |
 | `GET /v1/probabilities?lat=48.85&lon=2.35` | Probabilités des prévisions d'ensemble de Météo-France : PE-AROME (tranches de 3 h jusqu'à +51 h : pluie ≥ 1 et 5 mm, neige, rafales, grêle, orage) et PE-ARPEGE (24 h jusqu'à +96 h : pluie ≥ 1, 5, 10 et 20 mm), les cartes du dernier run en mémoire ; 404 hors de la métropole et de la Corse, 503 sans run récent des deux |
 | `GET /v1/radar/frames` | Images de la mosaïque radar Météo-France (lame d'eau, métropole, une toutes les 5 min, 3 h gardées) : dates, zone couverte, modèle de chemin des tuiles |
 | `GET /v1/radar/tiles/{epoch}/{z}/{x}/{y}.png` | Tuile PNG 256 px (Web Mercator, zooms 3 à 10) d'une image radar, classes d'intensité en couleurs, transparente sans pluie ; l'adresse porte la date de l'image : réponse immuable |
@@ -73,6 +75,13 @@ Nouvelle-Calédonie, îles de la Société, Tuamotu de l'ouest, Australes ; dess
 lus en `mmap`. La pluie du modèle est un cumul depuis le début du run : la pluie horaire est la différence de deux échéances. Les Marquises, Gambier, Wallis-et-Futuna,
 Saint-Pierre-et-Miquelon et les TAAF ne sont pas couverts. `METEO_AROMEOM_ENABLED=0` coupe la tâche. Décodage CCSDS : `imagecodecs` (libaec).
 Source : Météo-France, modèle AROME Outre-mer, Licence Ouverte Etalab 2.0 (document de licence de l'API sur le portail, lu le 18/11/2026).
+
+### Relevés de stations (DPClim) et Météo des forêts
+
+`DPClim/v1` est asynchrone : `commande-station/quotidienne` (202 et un numéro) puis `commande/fichier` (204 tant que ce n'est pas prêt, 201 avec le CSV ; 1,6 s relevé le 18/11/2026). Hier n'est disponible qu'après 11 h 30 UTC. Le cache garde, par station, les 14 derniers jours (base SQLite, clé `dpclim:<id>`) et n'est refait qu'une fois par jour ; les commandes sont étalées (`METEO_DPCLIM_COMMANDS_PER_MINUTE`, 6 par défaut et par processus) et une commande qui attendrait plus de `METEO_DPCLIM_MAX_WAIT_SECONDS` est refusée (503). Une valeur au code qualité 2 (« douteuse ») est écartée et nommée dans `doubtful`. `METEO_DPCLIM_ENABLED=0` coupe la route.
+
+`DPMeteoForets/v1` : le fichier `carte/encours` (CSV des 96 départements) n'existe que de juin à septembre ; hors saison le portail répond 404, la route répond `out_of_season` et la santé reste « fresh » (contrôle toutes les 6 h, toutes les 30 min en saison). Le format est celui de l'échantillon publié par Météo-France sur data.gouv.fr (22/05/2024) : **le fichier servi aujourd'hui n'a pas pu être lu hors saison**. `METEO_FORESTS_ENABLED=0` coupe la tâche.
+Source : Météo-France, données climatologiques de base et Météo des forêts, Licence Ouverte Etalab 2.0 (document de licence de chaque API sur le portail, lu le 18/11/2026).
 
 ## Développement & Tests locaux (Windows PowerShell)
 
