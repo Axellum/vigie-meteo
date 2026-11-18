@@ -104,6 +104,17 @@ class Settings(BaseSettings):
     pearp_keep_runs: int = Field(default=2, ge=1, le=12, alias="METEO_PEARP_KEEP_RUNS")
     pearp_max_age_minutes: int = Field(default=1200, ge=60, le=2880, alias="METEO_PEARP_MAX_AGE_MINUTES")
 
+    # AROME-OM (PaquetAROME-OM, les cinq modèles d'outre-mer à 0,025°) : température, humidité, vent, rafales, pression, nébulosité et pluie,
+    # 49 échéances horaires, 4 runs par jour publiés 6 h 20 à 8 h après leur heure (délai de 8 h 30 : tous les territoires sont alors complets) (relevé le 18/11/2026). Un fichier par échéance et par territoire.
+    aromeom_enabled: bool = Field(default=True, alias="METEO_AROMEOM_ENABLED")
+    meteofrance_aromeom_url: str = Field(default="https://public-api.meteofrance.fr/previnum/DPPaquetAROME-OM/v1", alias="METEOFRANCE_AROMEOM_URL")
+    aromeom_dir: str | None = Field(default=None, alias="METEO_AROMEOM_DIR")  # défaut : `aromeom/` à côté de la base SQLite
+    aromeom_publish_delay_minutes: int = Field(default=510, ge=0, le=1440, alias="METEO_AROMEOM_PUBLISH_DELAY_MINUTES")
+    aromeom_requests_per_minute: int = Field(default=10, ge=1, le=30, alias="METEO_AROMEOM_REQUESTS_PER_MINUTE")
+    aromeom_keep_runs: int = Field(default=2, ge=2, le=6, alias="METEO_AROMEOM_KEEP_RUNS")
+    # Au-delà de cet âge le dernier run n'est plus servi.
+    aromeom_max_age_minutes: int = Field(default=1200, ge=120, le=2880, alias="METEO_AROMEOM_MAX_AGE_MINUTES")
+
     # Durées de vie du cache (TTL en secondes) et fenêtre de tolérance "stale"
     forecast_ttl_seconds: int = Field(default=900, alias="METEO_FORECAST_TTL_SECONDS")
     nowcast_ttl_seconds: int = Field(default=180, alias="METEO_NOWCAST_TTL_SECONDS")

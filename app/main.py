@@ -14,8 +14,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app import __version__
+from app.aromeom_grid import AromeOmStore, find_window, merged_series
 from app.aromepi_grid import STEP_SECONDS
 from app.cache import CacheStore
+from app.collectors.aromeom import ATTRIBUTION as AROMEOM_ATTRIBUTION
+from app.collectors.aromeom import SOURCE_MODEL as AROMEOM_SOURCE_MODEL
+from app.collectors.aromeom import AromeOmCollector
 from app.collectors.aromepi import ATTRIBUTION as AROMEPI_ATTRIBUTION
 from app.collectors.aromepi import SOURCE_MODEL as AROMEPI_SOURCE_MODEL
 from app.collectors.aromepi import AromePiCollector, AromePiStore
@@ -39,6 +43,8 @@ from app.models import (
     CompactWeatherResponse,
     EnsembleBlock,
     HealthResponse,
+    OverseasResponse,
+    OverseasStep,
     ProbabilitiesResponse,
     ProbabilityWindow,
     ProblemDetail,
@@ -91,6 +97,11 @@ def create_app(
         app_instance.state.aromepi = aromepi
         aromepi_task = asyncio.create_task(aromepi.run_forever()) if aromepi.enabled() and own_client else None
 
+        aromeom_dir = Path(cfg.aromeom_dir) if cfg.aromeom_dir else Path(cfg.db_path).resolve().parent / "aromeom"
+        aromeom = AromeOmCollector(client, AromeOmStore(aromeom_dir, keep_runs=cfg.aromeom_keep_runs), cfg)
+        app_instance.state.aromeom = aromeom
+        aromeom_task = asyncio.create_task(aromeom.run_forever()) if aromeom.enabled() and own_client else None
+
         pearome_dir = Path(cfg.pearome_dir) if cfg.pearome_dir else Path(cfg.db_path).resolve().parent / "pearome"
         pearome = PeAromeCollector(client, ProbabilityStore(pearome_dir, keep_runs=cfg.pearome_keep_runs), cfg)
         app_instance.state.pearome = pearome
@@ -103,7 +114,7 @@ def create_app(
         try:
             yield
         finally:
-            for task in (pearome_task, pearp_task):
+            for task in (pearome_task, pearp_task, aromeom_task):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -218,6 +229,23 @@ def create_app(
             last_error=aromepi.last_error,
         )
 
+        aromeom: AromeOmCollector = request.app.state.aromeom
+        om_runs = await run_in_threadpool(aromeom.store.latest_runs, 1)
+        om_run = om_runs[0].run if om_runs else None
+        if not aromeom.enabled():
+            om_status = "not_configured"
+        elif om_run is not None and datetime.now(UTC) - om_run <= timedelta(minutes=cfg.aromeom_max_age_minutes):
+            om_status = "fresh"
+        else:
+            om_status = "stale" if om_run is not None else "unavailable"
+        sources["meteofrance-aromeom"] = SourceStatus(
+            status=om_status,
+            provider="meteofrance-aromeom",
+            updated_at=om_run,
+            age_seconds=None if om_run is None else max(0, int((datetime.now(UTC) - om_run).total_seconds())),
+            last_error=aromeom.last_error,
+        )
+
         for state_name, provider, max_age in (
             ("pearome", "meteofrance-pearome", cfg.pearome_max_age_minutes),
             ("pearp", "meteofrance-pearp", cfg.pearp_max_age_minutes),
@@ -323,6 +351,44 @@ def create_app(
             raise HTTPException(status_code=503, detail="Aucun run AROME-PI récent.")
         response.headers["Cache-Control"] = "public, max-age=300"
         return ShortTermResponse(source_model=AROMEPI_SOURCE_MODEL, attribution=AROMEPI_ATTRIBUTION, run=run.run, steps=steps)
+
+    @app.get("/v1/overseas", response_model=OverseasResponse, tags=["Météo"])
+    async def get_overseas(
+        request: Request,
+        response: Response,
+        lat: float = Query(..., ge=-90.0, le=90.0),
+        lon: float = Query(..., ge=-180.0, le=180.0),
+    ) -> OverseasResponse:
+        """Prévision horaire AROME-OM (Météo-France, outre-mer) d'un point : température, humidité, vent, rafales, pression, nébulosité et pluie, jusqu'à +48 h.
+
+        Les dernières heures de deux runs sont recollées (le plus récent l'emporte). Le point est lu au nœud de 0,025° le plus proche. 404 hors des fenêtres
+        servies (Guadeloupe, Martinique, Saint-Martin, Saint-Barthélemy, Guyane, La Réunion, Mayotte, Nouvelle-Calédonie, îles de la Société, Tuamotu de l'ouest et
+        Australes), 503 sans run récent."""
+        aromeom: AromeOmCollector = request.app.state.aromeom
+        runs = await run_in_threadpool(aromeom.store.latest_runs, 2)
+        now = datetime.now(UTC)
+        window = find_window(lat, lon)
+        if window is None:
+            raise HTTPException(status_code=404, detail="Point hors des fenêtres AROME-OM servies.")
+        if not runs or now - runs[0].run > timedelta(minutes=cfg.aromeom_max_age_minutes):
+            raise HTTPException(status_code=503, detail="Aucun run AROME-OM récent.")
+        series = await run_in_threadpool(merged_series, runs, lat, lon)
+        node = runs[0].node_latlon(lat, lon)
+        if series is None or node is None:
+            raise HTTPException(status_code=404, detail="Point hors des fenêtres AROME-OM servies.")
+        steps = [OverseasStep(time=when, **row) for when, row in series if when >= now - timedelta(hours=1)]
+        if not steps:
+            raise HTTPException(status_code=503, detail="Aucun run AROME-OM récent.")
+        response.headers["Cache-Control"] = "public, max-age=900"
+        return OverseasResponse(
+            source_model=AROMEOM_SOURCE_MODEL,
+            attribution=AROMEOM_ATTRIBUTION,
+            window=window.name,
+            utc_offset_s=window.utc_offset_s,
+            run=runs[0].run,
+            nearest_node={"lat": node[0], "lon": node[1]},
+            steps=steps,
+        )
 
     @app.get("/v1/probabilities", response_model=ProbabilitiesResponse, tags=["Météo"])
     async def get_probabilities(

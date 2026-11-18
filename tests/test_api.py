@@ -205,6 +205,7 @@ def test_vigilance_and_observation_routes_are_gone(tmp_path: Path) -> None:
             "meteofrance-nowcast",
             "meteofrance-radar",
             "meteofrance-aromepi",
+            "meteofrance-aromeom",
             "meteofrance-pearome",
             "meteofrance-pearp",
         }
