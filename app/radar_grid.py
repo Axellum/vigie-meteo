@@ -46,6 +46,14 @@ PALETTE = (
     (88, 28, 135, 255),
 )
 
+def legend() -> list[dict[str, object]]:
+    """Les classes 1..9 : intensité minimale (mm/h), couleur `#rrggbb` et opacité propre, pour les clients qui dessinent une légende."""
+    return [
+        {"min_mm_h": minimum, "color": "#%02x%02x%02x" % rgba[:3], "alpha": round(rgba[3] / 255, 2)}
+        for minimum, rgba in zip(THRESHOLDS_MM_H, PALETTE[1:], strict=True)
+    ]
+
+
 # Boîte (ouest, sud, est, nord) en degrés qui contient la grille : coins du fichier du 18/11/2026.
 BOUNDS = (-9.97, 37.45, 17.57, 53.67)
 

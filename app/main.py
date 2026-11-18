@@ -27,11 +27,12 @@ from app.models import (
     ProblemDetail,
     RadarFrameInfo,
     RadarFramesResponse,
+    RadarLegendClass,
     RainNowcastBlock,
     SourceStatus,
     UnifiedWeatherResponse,
 )
-from app.radar_grid import BOUNDS, MAX_ZOOM, MIN_ZOOM, tile_png
+from app.radar_grid import BOUNDS, MAX_ZOOM, MIN_ZOOM, legend, tile_png
 from app.security import ApiKeyMiddleware
 from app.services.weather import WeatherAggregatorService
 
@@ -221,6 +222,7 @@ def create_app(
             min_zoom=MIN_ZOOM,
             max_zoom=MAX_ZOOM,
             tile_path="/v1/radar/tiles/{epoch}/{z}/{x}/{y}.png",
+            legend=[RadarLegendClass(**entry) for entry in legend()],
             frames=[RadarFrameInfo(time=datetime.fromtimestamp(e, tz=UTC), epoch=e) for e in epochs],
         )
 

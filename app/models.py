@@ -117,6 +117,14 @@ class RadarFrameInfo(BaseModel):
     epoch: int = Field(..., description="La même date en secondes UNIX : c'est elle qui adresse les tuiles.")
 
 
+class RadarLegendClass(BaseModel):
+    """Une classe d'intensité de la pluie et sa couleur dans les tuiles."""
+
+    min_mm_h: float = Field(..., description="Intensité minimale de la classe (mm/h) ; elle va jusqu'au minimum de la suivante.")
+    color: str = Field(..., description="Couleur `#rrggbb` des tuiles.")
+    alpha: float = Field(..., description="Opacité propre de la couleur dans les tuiles (0 à 1).")
+
+
 class RadarFramesResponse(BaseModel):
     """Les images radar gardées (`GET /v1/radar/frames`), de la plus ancienne à la plus récente."""
 
@@ -127,6 +135,7 @@ class RadarFramesResponse(BaseModel):
     min_zoom: int
     max_zoom: int
     tile_path: str = Field(..., description="Modèle de chemin d'une tuile PNG 256 px (Web Mercator) : `{epoch}`, `{z}`, `{x}`, `{y}`.")
+    legend: list[RadarLegendClass] = Field(..., description="Les classes d'intensité, de la plus faible à la plus forte.")
     frames: list[RadarFrameInfo]
 
 

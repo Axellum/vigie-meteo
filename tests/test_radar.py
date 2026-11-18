@@ -291,6 +291,8 @@ def check_with_image(client: TestClient) -> None:
     assert body["frames"][0]["time"].startswith("2026-11-18T08:25:00")
     assert body["source_model"] == "meteofrance-lame-d-eau" and "Météo-France" in body["attribution"]
     assert body["bounds"][0] < -9 and body["bounds"][3] > 53 and (body["min_zoom"], body["max_zoom"]) == (3, 10)
+    assert [c["min_mm_h"] for c in body["legend"]] == [0.1, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+    assert body["legend"][0]["color"] == "#a6cee3" and body["legend"][-1]["alpha"] == 1.0
     x, y, px, py = place_in_tile(*PARIS, 8)
     r = client.get(f"/v1/radar/tiles/{EPOCH}/8/{x}/{y}.png")
     assert r.status_code == 200 and r.headers["content-type"] == "image/png"
