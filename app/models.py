@@ -246,3 +246,29 @@ class HealthResponse(BaseModel):
     db_ok: bool
     api_key_required: bool
     sources: dict[str, SourceStatus]
+
+
+class OverseasStep(BaseModel):
+    """Une heure de la prévision AROME-OM d'un point : `time` (UTC) est l'heure de validité."""
+
+    time: datetime
+    temperature_c: float | None = None
+    humidity_pct: float | None = None
+    wind_kmh: float | None = Field(None, description="Vent moyen à 10 m.")
+    wind_direction_deg: float | None = Field(None, description="Direction d'où vient le vent.")
+    gust_kmh: float | None = Field(None, description="Rafale maximale de l'heure qui finit à `time`.")
+    pressure_hpa: float | None = Field(None, description="Pression réduite au niveau de la mer.")
+    cloud_cover_pct: float | None = None
+    precip_mm: float | None = Field(None, description="Pluie de l'heure qui finit à `time` (différence de deux cumuls du modèle).")
+
+
+class OverseasResponse(BaseModel):
+    """La prévision horaire AROME-OM d'un point d'outre-mer (`GET /v1/overseas`)."""
+
+    source_model: str
+    attribution: str
+    window: str = Field(..., description="La fenêtre servie qui contient le point (nom).")
+    utc_offset_s: int = Field(..., description="Décalage horaire du territoire (fixe, sans heure d'été).")
+    run: datetime = Field(..., description="Heure du run le plus récent (UTC) ; les heures avant lui viennent du run précédent.")
+    nearest_node: dict[str, float] = Field(..., description="Latitude et longitude du nœud de la grille de 0,025° (environ 2,8 km) dont les valeurs sont servies.")
+    steps: list[OverseasStep] = Field(..., description="Les heures de validité de moins d'une heure dans le passé à +48 h après le run, de la plus proche à la plus lointaine.")

@@ -23,6 +23,7 @@ C'est la source météo interne de [Vigie](https://github.com/Axellum/vigie-api)
 | `GET /v1/rain-nowcast?lat=48.85&lon=2.35` | Pluie dans l'heure PIAF (tranches de 5 min datées de leur fin ; repli AROME HD 15 min) : lue par Vigie |
 | `GET /v1/forecast?...` | Proxy 100 % compatible avec la signature Open-Meteo ; avec `models=meteofrance_seamless` : AROME HD puis ARPEGE Europe, variable par variable (lu par Vigie pour la météo de la France) ; en-têtes `X-Cache-Status` (`fresh` ou `stale`) et `X-Cache-Age` |
 | `GET /v1/shortterm?lat=48.85&lon=2.35` | Grêle, rafales, visibilité et type de précipitation des prochaines heures (jusqu'à 6 h, pas de 15 min) du modèle AROME-PI de Météo-France : une carte de la France par run en mémoire, 404 hors de la métropole et de la Corse, 503 sans run récent : lue par Vigie |
+| `GET /v1/overseas?lat=14.6&lon=-61.0` | Prévision horaire AROME-OM de Météo-France pour un point d'outre-mer (température, humidité, vent, rafales, pression, nébulosité, pluie ; jusqu'à +48 h ; deux runs recollés) : 404 hors des fenêtres servies, 503 sans run récent : lue par Vigie |
 | `GET /v1/probabilities?lat=48.85&lon=2.35` | Probabilités des prévisions d'ensemble de Météo-France : PE-AROME (tranches de 3 h jusqu'à +51 h : pluie ≥ 1 et 5 mm, neige, rafales, grêle, orage) et PE-ARPEGE (24 h jusqu'à +96 h : pluie ≥ 1, 5, 10 et 20 mm), les cartes du dernier run en mémoire ; 404 hors de la métropole et de la Corse, 503 sans run récent des deux |
 | `GET /v1/radar/frames` | Images de la mosaïque radar Météo-France (lame d'eau, métropole, une toutes les 5 min, 3 h gardées) : dates, zone couverte, modèle de chemin des tuiles |
 | `GET /v1/radar/tiles/{epoch}/{z}/{x}/{y}.png` | Tuile PNG 256 px (Web Mercator, zooms 3 à 10) d'une image radar, classes d'intensité en couleurs, transparente sans pluie ; l'adresse porte la date de l'image : réponse immuable |
@@ -61,6 +62,17 @@ n'est jamais servi. `METEO_PEAROME_ENABLED=0` et `METEO_PEARP_ENABLED=0` coupent
 `python tools/measure_ensemble.py --day AAAA-MM-JJ --ends 3-9` (clé dans `VIGIE_METEOFRANCE_API_KEY`).
 Source : Météo-France, prévisions d'ensemble PE-AROME et PE-ARPEGE, Licence Ouverte Etalab 2.0 (document de licence de chaque API sur le portail, lu le 18/11/2026) :
 la source et la date du run sont à citer, les données ne sont pas altérées (voir l'ADR 0032 de vigie-api).
+
+### AROME-OM (prévisions de l'outre-mer)
+
+`DPPaquetAROME-OM/v1`, paquet `SP1` : un modèle par territoire (Antilles, Guyane, océan Indien, Nouvelle-Calédonie, Polynésie), grille de 0,025°, 4 runs par jour
+(00, 06, 12, 18 h UTC), 49 échéances horaires (+0 h à +48 h), **un fichier GRIB2 CCSDS de 1,5 à 12 Mo par échéance et par territoire** (245 requêtes et ~1,1 Go par run,
+espacées par `METEO_AROMEOM_REQUESTS_PER_MINUTE`, 10 par défaut). Un run est listé 6 h 20 après son heure et complet vers 8 h (relevé le 18/11/2026) : le délai par défaut est de 8 h 30.
+Seules des **fenêtres** autour des îles sont gardées (`app/aromeom_grid.py` : Guadeloupe et Martinique, Saint-Martin et Saint-Barthélemy, Guyane, La Réunion, Mayotte,
+Nouvelle-Calédonie, îles de la Société, Tuamotu de l'ouest, Australes ; dessinées à la main, sans masque terre-mer) : 80 Mo par run sur disque (`aromeom/`, 2 runs gardés),
+lus en `mmap`. La pluie du modèle est un cumul depuis le début du run : la pluie horaire est la différence de deux échéances. Les Marquises, Gambier, Wallis-et-Futuna,
+Saint-Pierre-et-Miquelon et les TAAF ne sont pas couverts. `METEO_AROMEOM_ENABLED=0` coupe la tâche. Décodage CCSDS : `imagecodecs` (libaec).
+Source : Météo-France, modèle AROME Outre-mer, Licence Ouverte Etalab 2.0 (document de licence de l'API sur le portail, lu le 18/11/2026).
 
 ## Développement & Tests locaux (Windows PowerShell)
 
