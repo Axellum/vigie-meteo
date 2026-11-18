@@ -23,6 +23,7 @@ C'est la source météo interne de [Vigie](https://github.com/Axellum/vigie-api)
 | `GET /v1/rain-nowcast?lat=48.85&lon=2.35` | Pluie dans l'heure PIAF (tranches de 5 min datées de leur fin ; repli AROME HD 15 min) : lue par Vigie |
 | `GET /v1/forecast?...` | Proxy 100 % compatible avec la signature Open-Meteo ; avec `models=meteofrance_seamless` : AROME HD puis ARPEGE Europe, variable par variable (lu par Vigie pour la météo de la France) ; en-têtes `X-Cache-Status` (`fresh` ou `stale`) et `X-Cache-Age` |
 | `GET /v1/shortterm?lat=48.85&lon=2.35` | Grêle, rafales, visibilité et type de précipitation des prochaines heures (jusqu'à 6 h, pas de 15 min) du modèle AROME-PI de Météo-France : une carte de la France par run en mémoire, 404 hors de la métropole et de la Corse, 503 sans run récent : lue par Vigie |
+| `GET /v1/probabilities?lat=48.85&lon=2.35` | Probabilités des prévisions d'ensemble de Météo-France : PE-AROME (tranches de 3 h jusqu'à +51 h : pluie ≥ 1 et 5 mm, neige, rafales, grêle, orage) et PE-ARPEGE (24 h jusqu'à +96 h : pluie ≥ 1, 5, 10 et 20 mm), les cartes du dernier run en mémoire ; 404 hors de la métropole et de la Corse, 503 sans run récent des deux |
 | `GET /v1/radar/frames` | Images de la mosaïque radar Météo-France (lame d'eau, métropole, une toutes les 5 min, 3 h gardées) : dates, zone couverte, modèle de chemin des tuiles |
 | `GET /v1/radar/tiles/{epoch}/{z}/{x}/{y}.png` | Tuile PNG 256 px (Web Mercator, zooms 3 à 10) d'une image radar, classes d'intensité en couleurs, transparente sans pluie ; l'adresse porte la date de l'image : réponse immuable |
 | `GET /v1/health` | État de la base SQLite et des circuits breakers |
@@ -46,6 +47,20 @@ la grille d'un run tient dans 15 Mo ; les 3 derniers runs complets sont gardés 
 fait télécharger un seul des deux processus. Un run incomplet n'est jamais servi. `METEO_AROMEPI_ENABLED=0` coupe la tâche.
 Mesure contre les stations au sol : `python tools/measure_aromepi.py --day AAAA-MM-JJ --hours 2-8` (clé dans `VIGIE_METEOFRANCE_API_KEY`).
 Source : Météo-France, modèle AROME-PI, Licence Ouverte Etalab 2.0 (document de licence de l'API sur le portail, lu le 18/11/2026 ; voir l'ADR 0031 de vigie-api).
+
+### Prévisions d'ensemble (PE-AROME, PE-ARPEGE : probabilités)
+
+`pearome/1.0` : 4 runs par jour (03, 09, 15, 21 h UTC), échéances horaires jusqu'à +51 h, **probabilités déjà calculées** par Météo-France, une carte par seuil
+et par échéance (0,8 Mo) : 7 produits x 17 tranches de 3 h = 119 requêtes par run, réduites à des blocs de 5 km (moyenne). `pearpege/1.0` : 4 runs par jour
+(00, 06, 12, 18 h UTC), **un service par membre** (`PEARP000` à `PEARP034`, 35 membres) et des valeurs : le cumul de 24 h de chaque membre à +24, +48, +72
+et +96 h (140 requêtes), et la probabilité d'un seuil est la part des membres qui le dépassent. Avec une emprise (`subset` de latitude et de longitude), ce WCS répond
+`400 « Lat and long parameters are not allowed »` à une requête valable deux fois sur trois (jusqu'à 7 de suite) : PE-ARPEGE est donc lu **sans emprise** (toute l'Europe,
+0,8 Mo par carte, 110 Mo par run) et découpé sur place ; PE-AROME garde l'emprise et rejoue ces 400 quand ils viennent. Requêtes espacées (`METEO_PEAROME_REQUESTS_PER_MINUTE`, 12 ; `METEO_PEARP_REQUESTS_PER_MINUTE`, 10),
+un seul processus télécharge (verrou de fichier), les derniers runs complets sont gardés sur disque (`pearome/` et `pearp/` à côté de la base), un run incomplet
+n'est jamais servi. `METEO_PEAROME_ENABLED=0` et `METEO_PEARP_ENABLED=0` coupent les tâches. Mesure contre les stations au sol :
+`python tools/measure_ensemble.py --day AAAA-MM-JJ --ends 3-9` (clé dans `VIGIE_METEOFRANCE_API_KEY`).
+Source : Météo-France, prévisions d'ensemble PE-AROME et PE-ARPEGE, Licence Ouverte Etalab 2.0 (document de licence de chaque API sur le portail, lu le 18/11/2026) :
+la source et la date du run sont à citer, les données ne sont pas altérées (voir l'ADR 0032 de vigie-api).
 
 ## Développement & Tests locaux (Windows PowerShell)
 

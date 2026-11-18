@@ -19,6 +19,16 @@ from app.cache import CacheStore
 from app.collectors.aromepi import ATTRIBUTION as AROMEPI_ATTRIBUTION
 from app.collectors.aromepi import SOURCE_MODEL as AROMEPI_SOURCE_MODEL
 from app.collectors.aromepi import AromePiCollector, AromePiStore
+from app.collectors.ensemble import (
+    AROME_ATTRIBUTION,
+    AROME_SOURCE_MODEL,
+    ARPEGE_ATTRIBUTION,
+    ARPEGE_SOURCE_MODEL,
+    MEMBERS,
+    PeAromeCollector,
+    PeArpegeCollector,
+    ProbabilityStore,
+)
 from app.collectors.meteofrance import MeteoFranceNowcastCollector
 from app.collectors.open_meteo import OpenMeteoCollector
 from app.collectors.radar import ATTRIBUTION as RADAR_ATTRIBUTION
@@ -27,7 +37,10 @@ from app.collectors.radar import SOURCE_MODEL as RADAR_SOURCE_MODEL
 from app.config import Settings, get_settings, redact_secret
 from app.models import (
     CompactWeatherResponse,
+    EnsembleBlock,
     HealthResponse,
+    ProbabilitiesResponse,
+    ProbabilityWindow,
     ProblemDetail,
     RadarFrameInfo,
     RadarFramesResponse,
@@ -78,9 +91,23 @@ def create_app(
         app_instance.state.aromepi = aromepi
         aromepi_task = asyncio.create_task(aromepi.run_forever()) if aromepi.enabled() and own_client else None
 
+        pearome_dir = Path(cfg.pearome_dir) if cfg.pearome_dir else Path(cfg.db_path).resolve().parent / "pearome"
+        pearome = PeAromeCollector(client, ProbabilityStore(pearome_dir, keep_runs=cfg.pearome_keep_runs), cfg)
+        app_instance.state.pearome = pearome
+        pearome_task = asyncio.create_task(pearome.run_forever()) if pearome.enabled() and own_client else None
+        pearp_dir = Path(cfg.pearp_dir) if cfg.pearp_dir else Path(cfg.db_path).resolve().parent / "pearp"
+        pearp = PeArpegeCollector(client, ProbabilityStore(pearp_dir, keep_runs=cfg.pearp_keep_runs), cfg)
+        app_instance.state.pearp = pearp
+        pearp_task = asyncio.create_task(pearp.run_forever()) if pearp.enabled() and own_client else None
+
         try:
             yield
         finally:
+            for task in (pearome_task, pearp_task):
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
             if aromepi_task is not None:
                 aromepi_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -191,6 +218,26 @@ def create_app(
             last_error=aromepi.last_error,
         )
 
+        for state_name, provider, max_age in (
+            ("pearome", "meteofrance-pearome", cfg.pearome_max_age_minutes),
+            ("pearp", "meteofrance-pearp", cfg.pearp_max_age_minutes),
+        ):
+            collector = getattr(request.app.state, state_name)
+            newest_run = await run_in_threadpool(collector.store.latest)
+            if not collector.enabled():
+                ensemble_status = "not_configured"
+            elif newest_run is not None and datetime.now(UTC) - newest_run.run <= timedelta(minutes=max_age):
+                ensemble_status = "fresh"
+            else:
+                ensemble_status = "stale" if newest_run is not None else "unavailable"
+            sources[provider] = SourceStatus(
+                status=ensemble_status,
+                provider=provider,
+                updated_at=newest_run.run if newest_run is not None else None,
+                age_seconds=None if newest_run is None else max(0, int((datetime.now(UTC) - newest_run.run).total_seconds())),
+                last_error=collector.last_error,
+            )
+
         global_status = "ok" if db_ok and not sources["open-meteo"].circuit_open else "degraded"
         return HealthResponse(
             status=global_status,
@@ -276,6 +323,50 @@ def create_app(
             raise HTTPException(status_code=503, detail="Aucun run AROME-PI récent.")
         response.headers["Cache-Control"] = "public, max-age=300"
         return ShortTermResponse(source_model=AROMEPI_SOURCE_MODEL, attribution=AROMEPI_ATTRIBUTION, run=run.run, steps=steps)
+
+    @app.get("/v1/probabilities", response_model=ProbabilitiesResponse, tags=["Météo"])
+    async def get_probabilities(
+        request: Request,
+        response: Response,
+        lat: float = Query(..., ge=-90.0, le=90.0),
+        lon: float = Query(..., ge=-180.0, le=180.0),
+    ) -> ProbabilitiesResponse:
+        """Probabilités des prévisions d'ensemble de Météo-France autour d'un point : PE-AROME (tranches de 3 h, jusqu'à +51 h : pluie, neige, rafales,
+        grêle, orage) et PE-ARPEGE (24 h, jusqu'à +96 h : pluie). Les cartes du dernier run sont lues en mémoire : le coût ne dépend pas du nombre
+        de points. 404 hors de la métropole et de la Corse, 503 sans run récent des deux ensembles."""
+        now = datetime.now(UTC)
+        blocks: dict[str, EnsembleBlock | None] = {}
+        have_run = False
+        for state_name, model, credit, window_hours, max_age in (
+            ("pearome", AROME_SOURCE_MODEL, AROME_ATTRIBUTION, 3, cfg.pearome_max_age_minutes),
+            ("pearp", ARPEGE_SOURCE_MODEL, ARPEGE_ATTRIBUTION, 24, cfg.pearp_max_age_minutes),
+        ):
+            collector = getattr(request.app.state, state_name)
+            run = await run_in_threadpool(collector.store.latest)
+            blocks[state_name] = None
+            if run is None or now - run.run > timedelta(minutes=max_age):
+                continue
+            have_run = True
+            values = run.point(lat, lon)
+            if values is None:
+                continue
+            by_hour: dict[int, dict[str, int]] = {}
+            for key, per_hour in values.items():
+                for hour, pct in per_hour.items():
+                    by_hour.setdefault(hour, {})[key] = pct
+            windows = [
+                ProbabilityWindow(time=run.run + timedelta(hours=hour), window_hours=window_hours, probability_pct=by_hour[hour])
+                for hour in sorted(by_hour)
+                if run.run + timedelta(hours=hour) >= now
+            ]
+            if windows:
+                blocks[state_name] = EnsembleBlock(source_model=model, attribution=credit, run=run.run, members=MEMBERS, windows=windows)
+        if blocks["pearome"] is None and blocks["pearp"] is None:
+            if have_run:
+                raise HTTPException(status_code=404, detail="Point hors de la zone des prévisions d'ensemble (métropole et Corse).")
+            raise HTTPException(status_code=503, detail="Aucun run récent des prévisions d'ensemble.")
+        response.headers["Cache-Control"] = "public, max-age=600"
+        return ProbabilitiesResponse(arome=blocks["pearome"], arpege=blocks["pearp"])
 
     @app.get("/v1/radar/frames", response_model=RadarFramesResponse, tags=["Radar"])
     async def get_radar_frames(request: Request, response: Response) -> RadarFramesResponse:
