@@ -79,6 +79,31 @@ class Settings(BaseSettings):
     # Au-delà de cet âge le dernier run n'est plus servi (il ne couvrirait plus que quelques échéances à venir).
     aromepi_max_age_minutes: int = Field(default=180, ge=30, le=1440, alias="METEO_AROMEPI_MAX_AGE_MINUTES")
 
+    # Prévisions d'ensemble (probabilités) : PE-AROME (`pearome/1.0`, +51 h, runs à 03/09/15/21 h UTC) et PE-ARPEGE (`pearpege/1.0`, un service par
+    # membre, +96 h lus, runs à 00/06/12/18 h UTC). Délais de publication à affiner à la mesure ; PE-AROME = 119 requêtes par run, PE-ARPEGE = 140.
+    pearome_enabled: bool = Field(default=True, alias="METEO_PEAROME_ENABLED")
+    meteofrance_pearome_url: str = Field(
+        default="https://public-api.meteofrance.fr/public/pearome/1.0/wcs/MF-NWP-HIGHRES-PEAROME-0025-FRANCE-WCS",
+        alias="METEOFRANCE_PEAROME_URL",
+    )
+    pearome_dir: str | None = Field(default=None, alias="METEO_PEAROME_DIR")  # défaut : `pearome/` à côté de la base SQLite
+    pearome_publish_delay_minutes: int = Field(default=120, ge=0, le=720, alias="METEO_PEAROME_PUBLISH_DELAY_MINUTES")
+    pearome_requests_per_minute: int = Field(default=12, ge=1, le=30, alias="METEO_PEAROME_REQUESTS_PER_MINUTE")
+    pearome_concurrency: int = Field(default=2, ge=1, le=6, alias="METEO_PEAROME_CONCURRENCY")
+    pearome_keep_runs: int = Field(default=3, ge=1, le=12, alias="METEO_PEAROME_KEEP_RUNS")
+    pearome_max_age_minutes: int = Field(default=840, ge=60, le=2880, alias="METEO_PEAROME_MAX_AGE_MINUTES")
+    pearp_enabled: bool = Field(default=True, alias="METEO_PEARP_ENABLED")
+    meteofrance_pearp_url: str = Field(
+        default="https://public-api.meteofrance.fr/public/pearpege/1.0/wcs/MF-NWP-GLOBAL-PEARP{member}-01-EUROPE-WCS",
+        alias="METEOFRANCE_PEARP_URL",
+    )
+    pearp_dir: str | None = Field(default=None, alias="METEO_PEARP_DIR")  # défaut : `pearp/` à côté de la base SQLite
+    pearp_publish_delay_minutes: int = Field(default=180, ge=0, le=720, alias="METEO_PEARP_PUBLISH_DELAY_MINUTES")
+    pearp_requests_per_minute: int = Field(default=10, ge=1, le=30, alias="METEO_PEARP_REQUESTS_PER_MINUTE")
+    pearp_concurrency: int = Field(default=2, ge=1, le=6, alias="METEO_PEARP_CONCURRENCY")
+    pearp_keep_runs: int = Field(default=2, ge=1, le=12, alias="METEO_PEARP_KEEP_RUNS")
+    pearp_max_age_minutes: int = Field(default=1200, ge=60, le=2880, alias="METEO_PEARP_MAX_AGE_MINUTES")
+
     # Durées de vie du cache (TTL en secondes) et fenêtre de tolérance "stale"
     forecast_ttl_seconds: int = Field(default=900, alias="METEO_FORECAST_TTL_SECONDS")
     nowcast_ttl_seconds: int = Field(default=180, alias="METEO_NOWCAST_TTL_SECONDS")

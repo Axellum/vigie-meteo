@@ -167,6 +167,36 @@ class ShortTermResponse(BaseModel):
     steps: list[ShortTermStep] = Field(..., description="Les échéances qui ne sont pas encore entièrement passées, de la plus proche à la plus lointaine.")
 
 
+class ProbabilityWindow(BaseModel):
+    """Les probabilités d'une fenêtre qui finit à `time` (UTC) et dure `window_hours` heures."""
+
+    time: datetime = Field(..., description="Fin de la fenêtre (UTC).")
+    window_hours: int = Field(..., description="Durée de la fenêtre en heures : 3 (PE-AROME) ou 24 (PE-ARPEGE).")
+    probability_pct: dict[str, int] = Field(
+        ...,
+        description="Pourcentage par grandeur, de 0 à 100. `rain_1mm`, `rain_5mm`, `rain_10mm`, `rain_20mm` : cumul de pluie de la fenêtre au moins égal à "
+        "ce seuil ; `snow_1mm` : cumul de neige d'au moins 1 mm ; `gust_30kt`, `gust_50kt` (nœuds), `hail` (diagnostic AROME > 8 kg/m2) et `storm` "
+        "(réflectivité maximale > 40 dBZ) : probabilité à l'instant où finit la fenêtre, pas sur les 3 h.",
+    )
+
+
+class EnsembleBlock(BaseModel):
+    """Les fenêtres d'une prévision d'ensemble de Météo-France autour d'un point (la probabilité du bloc de 5 km ou de la maille de 10 km qui le contient)."""
+
+    source_model: str
+    attribution: str
+    run: datetime = Field(..., description="Heure du run (UTC).")
+    members: int = Field(..., description="Nombre de membres de l'ensemble (35).")
+    windows: list[ProbabilityWindow] = Field(..., description="Les fenêtres qui ne sont pas encore entièrement passées, de la plus proche à la plus lointaine.")
+
+
+class ProbabilitiesResponse(BaseModel):
+    """Les probabilités des prévisions d'ensemble PE-AROME (3 h, jusqu'à +51 h) et PE-ARPEGE (24 h, jusqu'à +96 h) d'un point (`GET /v1/probabilities`)."""
+
+    arome: EnsembleBlock | None = Field(None, description="Absent sans run récent de PE-AROME.")
+    arpege: EnsembleBlock | None = Field(None, description="Absent sans run récent de PE-ARPEGE.")
+
+
 class Attribution(BaseModel):
     """Mentions légales et crédits obligatoires des fournisseurs."""
 
