@@ -110,6 +110,26 @@ class RainNowcastBlock(BaseModel):
     )
 
 
+class RadarFrameInfo(BaseModel):
+    """Une image de la mosaïque radar."""
+
+    time: datetime = Field(..., description="Fin des 5 minutes de cumul (UTC).")
+    epoch: int = Field(..., description="La même date en secondes UNIX : c'est elle qui adresse les tuiles.")
+
+
+class RadarFramesResponse(BaseModel):
+    """Les images radar gardées (`GET /v1/radar/frames`), de la plus ancienne à la plus récente."""
+
+    source_model: str
+    attribution: str
+    interval_minutes: int = 5
+    bounds: list[float] = Field(..., description="Ouest, sud, est, nord (degrés) de la zone couverte.")
+    min_zoom: int
+    max_zoom: int
+    tile_path: str = Field(..., description="Modèle de chemin d'une tuile PNG 256 px (Web Mercator) : `{epoch}`, `{z}`, `{x}`, `{y}`.")
+    frames: list[RadarFrameInfo]
+
+
 class Attribution(BaseModel):
     """Mentions légales et crédits obligatoires des fournisseurs."""
 

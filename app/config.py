@@ -53,6 +53,15 @@ class Settings(BaseSettings):
     # fond, tant qu'elle a moins de cet âge ; au-delà, la requête attend le téléchargement (ou bascule en repli).
     piaf_grid_max_stale_seconds: int = Field(default=900, ge=60, alias="METEO_PIAF_GRID_MAX_STALE_SECONDS")
 
+    # Mosaïque radar « lame d'eau » (DPRadar, métropole) : images gardées sur disque pour l'animation et les tuiles.
+    radar_enabled: bool = Field(default=True, alias="METEO_RADAR_ENABLED")
+    radar_observation_url: str = Field(
+        default="https://public-api.meteofrance.fr/public/DPRadar/v1/mosaiques/METROPOLE/observations/LAME_D_EAU",
+        alias="METEOFRANCE_RADAR_URL",
+    )
+    radar_dir: str | None = Field(default=None, alias="METEO_RADAR_DIR")  # défaut : `radar/` à côté de la base SQLite
+    radar_keep_minutes: int = Field(default=180, ge=15, le=1440, alias="METEO_RADAR_KEEP_MINUTES")
+
     # Durées de vie du cache (TTL en secondes) et fenêtre de tolérance "stale"
     forecast_ttl_seconds: int = Field(default=900, alias="METEO_FORECAST_TTL_SECONDS")
     nowcast_ttl_seconds: int = Field(default=180, alias="METEO_NOWCAST_TTL_SECONDS")

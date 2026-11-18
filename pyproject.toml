@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2.8.0",
     "pydantic-settings>=2.4.0",
     "numpy>=2.0",
+    "h5py>=3.11",
 ]
 
 [project.optional-dependencies]
