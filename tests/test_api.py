@@ -262,6 +262,29 @@ def test_proxy_forecast_and_marine_endpoints(tmp_path: Path) -> None:
         assert any("/v1/marine" in u for u in seen_urls)
 
 
+def test_proxy_forecast_says_whether_the_answer_is_fresh_or_stale(tmp_path: Path) -> None:
+    """Un client qui exige du frais (Vigie) doit pouvoir refuser une réponse servie depuis un cache périmé."""
+    state = {"up": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not state["up"]:
+            return httpx.Response(503)
+        return httpx.Response(200, json=_sample_open_meteo_payload())
+
+    params = {"latitude": 47.66, "longitude": -2.76, "models": "meteofrance_seamless", "current": "temperature_2m"}
+    with _make_client(tmp_path, handler) as client:
+        first = client.get("/v1/forecast", params=params)
+        assert first.headers["x-cache-status"] == "fresh" and first.headers["x-cache-age"] == "0"
+        assert first.json() == _sample_open_meteo_payload()  # the body is Open-Meteo's, unchanged
+
+        # Open-Meteo goes down and the cached answer expires: the proxy still answers, and says so.
+        state["up"] = False
+        client.app.state.settings.forecast_ttl_seconds = 0
+        stale = client.get("/v1/forecast", params=params)
+        assert stale.status_code == 200 and stale.headers["x-cache-status"] == "stale"
+        assert stale.json() == first.json()
+
+
 def _sample_arome_15m_payload() -> dict[str, Any]:
     return {
         "latitude": 43.65,

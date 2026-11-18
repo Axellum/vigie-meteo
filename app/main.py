@@ -169,8 +169,12 @@ def create_app(
         return await service.get_rain_nowcast(lat=lat, lon=lon)
 
     @app.get("/v1/forecast", tags=["Compatibilité Open-Meteo"])
-    async def proxy_open_meteo_forecast(request: Request) -> dict[str, Any]:
-        """Proxy compatible Open-Meteo `/v1/forecast` avec cache SQLite local."""
+    async def proxy_open_meteo_forecast(request: Request) -> JSONResponse:
+        """Proxy compatible Open-Meteo `/v1/forecast` avec cache SQLite local.
+
+        Le corps est celui d'Open-Meteo, inchangé. Deux en-têtes disent d'où il vient, pour qu'un client qui exige du frais
+        puisse refuser une réponse périmée (servie quand Open-Meteo ne répond plus, jusqu'à `METEO_MAX_STALE_SECONDS`) :
+        `X-Cache-Status` (`fresh` ou `stale`) et `X-Cache-Age` (secondes depuis la dernière lecture réussie)."""
         om_collector: OpenMeteoCollector = request.app.state.om_collector
         params = dict(request.query_params)
         if "latitude" not in params or "longitude" not in params:
@@ -178,7 +182,10 @@ def create_app(
         payload, status = await om_collector.proxy_raw_forecast(params)
         if payload is None:
             raise HTTPException(status_code=503, detail=f"Open-Meteo indisponible ({status.last_error}).")
-        return payload
+        return JSONResponse(
+            content=payload,
+            headers={"X-Cache-Status": status.status, "X-Cache-Age": str(status.age_seconds or 0)},
+        )
 
     @app.get("/v1/marine", tags=["Compatibilité Open-Meteo"])
     async def proxy_open_meteo_marine(request: Request) -> dict[str, Any]:
