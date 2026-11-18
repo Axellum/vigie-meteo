@@ -200,7 +200,7 @@ def test_vigilance_and_observation_routes_are_gone(tmp_path: Path) -> None:
     with _make_client(tmp_path, handler) as client:
         for path in ("/v1/vigilances", "/v1/vigilances/geojson", "/v1/observations?lat=48.85&lon=2.35"):
             assert client.get(path).status_code == 404, path
-        assert set(client.get("/v1/health").json()["sources"]) == {"open-meteo", "meteofrance-nowcast"}
+        assert set(client.get("/v1/health").json()["sources"]) == {"open-meteo", "meteofrance-nowcast", "meteofrance-radar"}
 
 
 def test_api_key_auth_and_rfc9457_problem_json(tmp_path: Path) -> None:

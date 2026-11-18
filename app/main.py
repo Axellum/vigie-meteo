@@ -1,10 +1,15 @@
 """Point d'entrée FastAPI de l'API Météo-France unifiée."""
 
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -12,15 +17,21 @@ from app import __version__
 from app.cache import CacheStore
 from app.collectors.meteofrance import MeteoFranceNowcastCollector
 from app.collectors.open_meteo import OpenMeteoCollector
+from app.collectors.radar import ATTRIBUTION as RADAR_ATTRIBUTION
+from app.collectors.radar import FRESH_WITHIN_S, RadarCollector, RadarStore
+from app.collectors.radar import SOURCE_MODEL as RADAR_SOURCE_MODEL
 from app.config import Settings, get_settings, redact_secret
 from app.models import (
     CompactWeatherResponse,
     HealthResponse,
     ProblemDetail,
+    RadarFrameInfo,
+    RadarFramesResponse,
     RainNowcastBlock,
     SourceStatus,
     UnifiedWeatherResponse,
 )
+from app.radar_grid import BOUNDS, MAX_ZOOM, MIN_ZOOM, tile_png
 from app.security import ApiKeyMiddleware
 from app.services.weather import WeatherAggregatorService
 
@@ -48,9 +59,19 @@ def create_app(
         app_instance.state.now_collector = now_collector
         app_instance.state.weather_service = service
 
+        radar_dir = Path(cfg.radar_dir) if cfg.radar_dir else Path(cfg.db_path).resolve().parent / "radar"
+        radar_store = RadarStore(radar_dir, keep_seconds=cfg.radar_keep_minutes * 60)
+        radar = RadarCollector(client, radar_store, cfg)
+        app_instance.state.radar = radar
+        radar_task = asyncio.create_task(radar.run_forever()) if radar.enabled() and own_client else None
+
         try:
             yield
         finally:
+            if radar_task is not None:
+                radar_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await radar_task
             cache.close()
             if own_client:
                 await client.aclose()
@@ -120,6 +141,23 @@ def create_app(
                 last_error=st["last_error"],
             )
 
+        radar: RadarCollector = request.app.state.radar
+        epochs = radar.store.epochs()
+        newest = epochs[-1] if epochs else None
+        if not radar.enabled():
+            radar_status = "not_configured"
+        elif newest is not None and datetime.now(UTC).timestamp() - newest <= FRESH_WITHIN_S:
+            radar_status = "fresh"
+        else:
+            radar_status = "stale" if newest is not None else "unavailable"
+        sources["meteofrance-radar"] = SourceStatus(
+            status=radar_status,
+            provider="meteofrance-radar",
+            updated_at=datetime.fromtimestamp(newest, tz=UTC) if newest is not None else None,
+            age_seconds=None if newest is None else max(0, int(datetime.now(UTC).timestamp() - newest)),
+            last_error=radar.last_error,
+        )
+
         global_status = "ok" if db_ok and not sources["open-meteo"].circuit_open else "degraded"
         return HealthResponse(
             status=global_status,
@@ -167,6 +205,36 @@ def create_app(
         """Retourne la pluie dans l'heure officielle ou le repli AROME HD 15 min."""
         service: WeatherAggregatorService = request.app.state.weather_service
         return await service.get_rain_nowcast(lat=lat, lon=lon)
+
+    @app.get("/v1/radar/frames", response_model=RadarFramesResponse, tags=["Radar"])
+    async def get_radar_frames(request: Request, response: Response) -> RadarFramesResponse:
+        """Les images de la mosaïque radar Météo-France (lame d'eau, métropole) gardées, toutes les 5 minutes."""
+        radar: RadarCollector = request.app.state.radar
+        epochs = radar.store.epochs()
+        if not epochs:
+            raise HTTPException(status_code=503, detail="Aucune image radar pour l'instant.")
+        response.headers["Cache-Control"] = "public, max-age=60"
+        return RadarFramesResponse(
+            source_model=RADAR_SOURCE_MODEL,
+            attribution=RADAR_ATTRIBUTION,
+            bounds=list(BOUNDS),
+            min_zoom=MIN_ZOOM,
+            max_zoom=MAX_ZOOM,
+            tile_path="/v1/radar/tiles/{epoch}/{z}/{x}/{y}.png",
+            frames=[RadarFrameInfo(time=datetime.fromtimestamp(e, tz=UTC), epoch=e) for e in epochs],
+        )
+
+    @app.get("/v1/radar/tiles/{epoch}/{z}/{x}/{y}.png", tags=["Radar"], response_class=Response)
+    async def get_radar_tile(request: Request, epoch: int, z: int, x: int, y: int) -> Response:
+        """Une tuile PNG (256 px, Web Mercator) d'une image radar ; l'adresse contient la date, donc elle ne change jamais."""
+        radar: RadarCollector = request.app.state.radar
+        if not (0 <= z <= MAX_ZOOM) or not (0 <= x < 2**z) or not (0 <= y < 2**z):
+            raise HTTPException(status_code=404, detail="Tuile hors de la carte.")
+        frame = await run_in_threadpool(radar.store.load, epoch)
+        if frame is None:
+            raise HTTPException(status_code=404, detail="Image radar inconnue ou déjà purgée.")
+        png = await run_in_threadpool(tile_png, frame, z, x, y)
+        return Response(content=png, media_type="image/png", headers={"Cache-Control": "public, max-age=86400, immutable"})
 
     @app.get("/v1/forecast", tags=["Compatibilité Open-Meteo"])
     async def proxy_open_meteo_forecast(request: Request) -> JSONResponse:
