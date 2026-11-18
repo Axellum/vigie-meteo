@@ -7,7 +7,7 @@ Conventions appliquées :
 - Erreurs HTTP conformes à la RFC 9457 (`application/problem+json`).
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -272,3 +272,58 @@ class OverseasResponse(BaseModel):
     run: datetime = Field(..., description="Heure du run le plus récent (UTC) ; les heures avant lui viennent du run précédent.")
     nearest_node: dict[str, float] = Field(..., description="Latitude et longitude du nœud de la grille de 0,025° (environ 2,8 km) dont les valeurs sont servies.")
     steps: list[OverseasStep] = Field(..., description="Les heures de validité de moins d'une heure dans le passé à +48 h après le run, de la plus proche à la plus lointaine.")
+
+
+class StationDay(BaseModel):
+    """Le relevé quotidien d'une station pour un jour (`date`, jour civil UTC de la mesure ; la pluie est celle de 06 h UTC ce jour à 06 h UTC le lendemain)."""
+
+    date: date
+    rain_mm: float | None = Field(
+        None, description="Cumul de précipitations sur 24 h (de 06 h UTC le jour J à 06 h UTC le jour J+1)."
+    )
+    tmin_c: float | None = Field(None, description="Température minimale sous abri.")
+    tmax_c: float | None = Field(None, description="Température maximale sous abri.")
+    tmean_c: float | None = Field(None, description="Moyenne quotidienne des températures horaires sous abri.")
+    wind_mean_ms: float | None = Field(None, description="Moyenne quotidienne du vent moyenné sur 10 min à 10 m (m/s).")
+    gust_ms: float | None = Field(None, description="Maximum quotidien du vent instantané à 10 m (m/s).")
+    doubtful: list[str] = Field(
+        default_factory=list,
+        description="Grandeurs écartées (`null`) parce que Météo-France les marque douteuses (code qualité 2).",
+    )
+
+
+class StationDailyResponse(BaseModel):
+    """Les derniers jours mesurés par une station Météo-France (`GET /v1/station-daily`)."""
+
+    source_model: str
+    attribution: str
+    station: str = Field(..., description="Numéro Météo-France de la station (8 chiffres).")
+    last_day: date | None = Field(
+        None, description="Le dernier jour que le portail pouvait donner à ce moment (hier après 11 h 30 UTC)."
+    )
+    fetched_at: datetime | None = Field(None, description="Quand le portail a été interrogé pour cette station.")
+    days: list[StationDay] = Field(
+        ..., description="Du plus ancien au plus récent ; vide si la station n'a rien mesuré sur la période."
+    )
+
+
+class ForestDepartment(BaseModel):
+    """Le niveau de danger de feux de forêt d'un département : 1 faible, 2 modéré, 3 élevé, 4 très élevé."""
+
+    department: str = Field(..., description="Code du département (`01`, `2A`, `13`...).")
+    name: str | None = None
+    level_d1: int | None = Field(None, description="Niveau du jour J+1.")
+    level_d2: int | None = Field(None, description="Niveau du jour J+2.")
+
+
+class ForestsResponse(BaseModel):
+    """La Météo des forêts (`GET /v1/forests`) : `available` quand le portail publie, `out_of_season` sinon (le flux est saisonnier, de juin à septembre)."""
+
+    source_model: str
+    attribution: str
+    status: Literal["available", "out_of_season"]
+    reference_time: datetime | None = Field(
+        None, description="Date de la publication servie (UTC) ; `null` hors saison."
+    )
+    checked_at: datetime | None = Field(None, description="Dernière fois que le portail a été interrogé.")
+    departments: list[ForestDepartment] = Field(default_factory=list)

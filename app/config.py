@@ -115,6 +115,27 @@ class Settings(BaseSettings):
     # Au-delà de cet âge le dernier run n'est plus servi.
     aromeom_max_age_minutes: int = Field(default=1200, ge=120, le=2880, alias="METEO_AROMEOM_MAX_AGE_MINUTES")
 
+    # Relevés quotidiens d'une station (DPClim, commande asynchrone puis fichier CSV) : une commande (3 à 4 requêtes) par station et par jour au plus,
+    # étalée pour laisser le quota de 50 par minute aux autres sources. Avec deux processus, le plafond réel est le double.
+    dpclim_enabled: bool = Field(default=True, alias="METEO_DPCLIM_ENABLED")
+    meteofrance_dpclim_url: str = Field(
+        default="https://public-api.meteofrance.fr/public/DPClim/v1", alias="METEOFRANCE_DPCLIM_URL"
+    )
+    dpclim_commands_per_minute: int = Field(default=6, ge=1, le=20, alias="METEO_DPCLIM_COMMANDS_PER_MINUTE")
+    # Au-delà de cette attente pour passer devant les autres commandes, la route répond 503 (le client réessaie plus tard).
+    dpclim_max_wait_seconds: float = Field(default=10.0, ge=0.0, le=60.0, alias="METEO_DPCLIM_MAX_WAIT_SECONDS")
+
+    # Météo des forêts (DPMeteoForets) : danger de feux par département, J+1 et J+2, publié l'été (juin à septembre) vers 17 h locales.
+    # Hors saison le portail répond 404 : ce n'est pas une panne.
+    forests_enabled: bool = Field(default=True, alias="METEO_FORESTS_ENABLED")
+    meteofrance_forests_url: str = Field(
+        default="https://public-api.meteofrance.fr/public/DPMeteoForets/v1", alias="METEOFRANCE_FORESTS_URL"
+    )
+    forests_poll_minutes: int = Field(default=30, ge=5, le=240, alias="METEO_FORESTS_POLL_MINUTES")
+    forests_off_season_poll_minutes: int = Field(
+        default=360, ge=30, le=1440, alias="METEO_FORESTS_OFF_SEASON_POLL_MINUTES"
+    )
+
     # Durées de vie du cache (TTL en secondes) et fenêtre de tolérance "stale"
     forecast_ttl_seconds: int = Field(default=900, alias="METEO_FORECAST_TTL_SECONDS")
     nowcast_ttl_seconds: int = Field(default=180, alias="METEO_NOWCAST_TTL_SECONDS")
