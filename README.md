@@ -45,7 +45,7 @@ maximum pour les rafales et la grêle, minimum pour la visibilité, nœud centra
 la grille d'un run tient dans 15 Mo ; les 3 derniers runs complets sont gardés sur disque (`aromepi/` à côté de la base) et un verrou de fichier
 fait télécharger un seul des deux processus. Un run incomplet n'est jamais servi. `METEO_AROMEPI_ENABLED=0` coupe la tâche.
 Mesure contre les stations au sol : `python tools/measure_aromepi.py --day AAAA-MM-JJ --hours 2-8` (clé dans `VIGIE_METEOFRANCE_API_KEY`).
-Source : Météo-France, modèle AROME-PI ; licence de ces données non vérifiée (voir l'ADR 0031 de vigie-api).
+Source : Météo-France, modèle AROME-PI, Licence Ouverte Etalab 2.0 (document de licence de l'API sur le portail, lu le 18/11/2026 ; voir l'ADR 0031 de vigie-api).
 
 ## Développement & Tests locaux (Windows PowerShell)
 

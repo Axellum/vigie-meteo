@@ -45,7 +45,7 @@ except ImportError:  # Windows : pas de verrou, un seul processus en développem
 log = logging.getLogger(__name__)
 
 SOURCE_MODEL = "meteofrance-arome-pi"
-ATTRIBUTION = "Source : Météo-France, modèle AROME-PI (prévision immédiate)"
+ATTRIBUTION = "Source : Météo-France, modèle AROME-PI (prévision immédiate), Licence Ouverte 2.0"
 # Zone demandée : la métropole et la Corse (celle de PIAF) ; au-delà de ces bornes la carte pleine contient un masque que le décodeur refuse.
 BBOX = ("long(-6,10.5)", "lat(41,51.5)")
 RETRY_EVERY_S = 180
