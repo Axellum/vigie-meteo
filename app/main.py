@@ -66,7 +66,7 @@ from app.models import (
     StationDailyResponse,
     UnifiedWeatherResponse,
 )
-from app.radar_grid import BOUNDS, MAX_ZOOM, MIN_ZOOM, legend, tile_png
+from app.radar_grid import AREAS, MAX_ZOOM, METROPOLE, MIN_ZOOM, legend, tile_png
 from app.security import ApiKeyMiddleware
 from app.services.weather import WeatherAggregatorService
 
@@ -95,10 +95,24 @@ def create_app(
         app_instance.state.weather_service = service
 
         radar_dir = Path(cfg.radar_dir) if cfg.radar_dir else Path(cfg.db_path).resolve().parent / "radar"
-        radar_store = RadarStore(radar_dir, keep_seconds=cfg.radar_keep_minutes * 60)
-        radar = RadarCollector(client, radar_store, cfg)
-        app_instance.state.radar = radar
-        radar_task = asyncio.create_task(radar.run_forever()) if radar.enabled() and own_client else None
+        # Un collecteur par zone ; la métropole garde le dossier d'avant (`radar/`), les autres ont `radar/<zone>/`.
+        wanted = [name.strip() for name in cfg.radar_areas.split(",") if name.strip() in AREAS] or [METROPOLE.slug]
+        radars: dict[str, RadarCollector] = {}
+        for slug in dict.fromkeys(wanted):
+            area = AREAS[slug]
+            directory = radar_dir if area is METROPOLE else radar_dir / area.slug
+            radars[slug] = RadarCollector(
+                client, RadarStore(directory, keep_seconds=cfg.radar_keep_minutes * 60, area=area), cfg, area
+            )
+        # La métropole reste toujours servie (ses routes d'avant) : sans image si elle n'est pas dans la liste.
+        radars.setdefault(METROPOLE.slug, RadarCollector(client, RadarStore(radar_dir, keep_seconds=cfg.radar_keep_minutes * 60), cfg))
+        app_instance.state.radars = radars
+        app_instance.state.radar = radars[METROPOLE.slug]
+        radar_tasks = [
+            asyncio.create_task(radar.run_forever())
+            for slug, radar in radars.items()
+            if slug in wanted and radar.enabled() and own_client
+        ]
 
         aromepi_dir = Path(cfg.aromepi_dir) if cfg.aromepi_dir else Path(cfg.db_path).resolve().parent / "aromepi"
         aromepi_store = AromePiStore(aromepi_dir, keep_runs=cfg.aromepi_keep_runs)
@@ -138,7 +152,7 @@ def create_app(
                 aromepi_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await aromepi_task
-            if radar_task is not None:
+            for radar_task in radar_tasks:
                 radar_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await radar_task
@@ -211,22 +225,23 @@ def create_app(
                 last_error=st["last_error"],
             )
 
-        radar: RadarCollector = request.app.state.radar
-        epochs = radar.store.epochs()
-        newest = epochs[-1] if epochs else None
-        if not radar.enabled():
-            radar_status = "not_configured"
-        elif newest is not None and datetime.now(UTC).timestamp() - newest <= FRESH_WITHIN_S:
-            radar_status = "fresh"
-        else:
-            radar_status = "stale" if newest is not None else "unavailable"
-        sources["meteofrance-radar"] = SourceStatus(
-            status=radar_status,
-            provider="meteofrance-radar",
-            updated_at=datetime.fromtimestamp(newest, tz=UTC) if newest is not None else None,
-            age_seconds=None if newest is None else max(0, int(datetime.now(UTC).timestamp() - newest)),
-            last_error=radar.last_error,
-        )
+        for slug, radar in request.app.state.radars.items():
+            epochs = radar.store.epochs()
+            newest = epochs[-1] if epochs else None
+            if not radar.enabled():
+                radar_status = "not_configured"
+            elif newest is not None and datetime.now(UTC).timestamp() - newest <= FRESH_WITHIN_S:
+                radar_status = "fresh"
+            else:
+                radar_status = "stale" if newest is not None else "unavailable"
+            name = "meteofrance-radar" if slug == METROPOLE.slug else f"meteofrance-radar-{slug}"
+            sources[name] = SourceStatus(
+                status=radar_status,
+                provider=name,
+                updated_at=datetime.fromtimestamp(newest, tz=UTC) if newest is not None else None,
+                age_seconds=None if newest is None else max(0, int(datetime.now(UTC).timestamp() - newest)),
+                last_error=radar.last_error,
+            )
 
         aromepi: AromePiCollector = request.app.state.aromepi
         latest_run = await run_in_threadpool(aromepi.store.latest)
@@ -527,29 +542,38 @@ def create_app(
         response.headers["Cache-Control"] = "public, max-age=600"
         return ProbabilitiesResponse(arome=blocks["pearome"], arpege=blocks["pearp"])
 
-    @app.get("/v1/radar/frames", response_model=RadarFramesResponse, tags=["Radar"])
-    async def get_radar_frames(request: Request, response: Response) -> RadarFramesResponse:
-        """Les images de la mosaïque radar Météo-France (lame d'eau, métropole) gardées, toutes les 5 minutes."""
-        radar: RadarCollector = request.app.state.radar
+    def radar_of(request: Request, slug: str) -> RadarCollector:
+        radar = request.app.state.radars.get(slug)
+        if radar is None:
+            raise HTTPException(status_code=404, detail="Zone radar inconnue : " + ", ".join(AREAS) + ".")
+        return radar
+
+    def frames_of(request: Request, response: Response, slug: str) -> RadarFramesResponse:
+        radar = radar_of(request, slug)
         epochs = radar.store.epochs()
         if not epochs:
             raise HTTPException(status_code=503, detail="Aucune image radar pour l'instant.")
+        area = radar.area
         response.headers["Cache-Control"] = "public, max-age=60"
+        tile_path = (
+            "/v1/radar/tiles/{epoch}/{z}/{x}/{y}.png"
+            if area is METROPOLE
+            else f"/v1/radar/{area.slug}/tiles/{{epoch}}/{{z}}/{{x}}/{{y}}.png"
+        )
         return RadarFramesResponse(
+            area=area.slug,
             source_model=RADAR_SOURCE_MODEL,
             attribution=RADAR_ATTRIBUTION,
-            bounds=list(BOUNDS),
+            bounds=list(area.bounds),
             min_zoom=MIN_ZOOM,
             max_zoom=MAX_ZOOM,
-            tile_path="/v1/radar/tiles/{epoch}/{z}/{x}/{y}.png",
+            tile_path=tile_path,
             legend=[RadarLegendClass(**entry) for entry in legend()],
             frames=[RadarFrameInfo(time=datetime.fromtimestamp(e, tz=UTC), epoch=e) for e in epochs],
         )
 
-    @app.get("/v1/radar/tiles/{epoch}/{z}/{x}/{y}.png", tags=["Radar"], response_class=Response)
-    async def get_radar_tile(request: Request, epoch: int, z: int, x: int, y: int) -> Response:
-        """Une tuile PNG (256 px, Web Mercator) d'une image radar ; l'adresse contient la date, donc elle ne change jamais."""
-        radar: RadarCollector = request.app.state.radar
+    async def tile_of(request: Request, slug: str, epoch: int, z: int, x: int, y: int) -> Response:
+        radar = radar_of(request, slug)
         if not (0 <= z <= MAX_ZOOM) or not (0 <= x < 2**z) or not (0 <= y < 2**z):
             raise HTTPException(status_code=404, detail="Tuile hors de la carte.")
         frame = await run_in_threadpool(radar.store.load, epoch)
@@ -557,6 +581,26 @@ def create_app(
             raise HTTPException(status_code=404, detail="Image radar inconnue ou déjà purgée.")
         png = await run_in_threadpool(tile_png, frame, z, x, y)
         return Response(content=png, media_type="image/png", headers={"Cache-Control": "public, max-age=86400, immutable"})
+
+    @app.get("/v1/radar/frames", response_model=RadarFramesResponse, tags=["Radar"])
+    async def get_radar_frames(request: Request, response: Response) -> RadarFramesResponse:
+        """Les images de la mosaïque radar de la métropole (lame d'eau) gardées, toutes les 5 minutes (comme `/v1/radar/france/frames`)."""
+        return frames_of(request, response, METROPOLE.slug)
+
+    @app.get("/v1/radar/tiles/{epoch}/{z}/{x}/{y}.png", tags=["Radar"], response_class=Response)
+    async def get_radar_tile(request: Request, epoch: int, z: int, x: int, y: int) -> Response:
+        """Une tuile PNG (256 px, Web Mercator) d'une image radar de la métropole ; l'adresse contient la date, donc elle ne change jamais."""
+        return await tile_of(request, METROPOLE.slug, epoch, z, x, y)
+
+    @app.get("/v1/radar/{area}/frames", response_model=RadarFramesResponse, tags=["Radar"])
+    async def get_radar_area_frames(request: Request, response: Response, area: str) -> RadarFramesResponse:
+        """Les images d'une mosaïque radar (`france`, `antilles`, `reunion`, `new-caledonia`) gardées, toutes les 5 minutes."""
+        return frames_of(request, response, area)
+
+    @app.get("/v1/radar/{area}/tiles/{epoch}/{z}/{x}/{y}.png", tags=["Radar"], response_class=Response)
+    async def get_radar_area_tile(request: Request, area: str, epoch: int, z: int, x: int, y: int) -> Response:
+        """Une tuile PNG (256 px, Web Mercator) d'une image d'une mosaïque radar ; l'adresse contient la date, donc elle ne change jamais."""
+        return await tile_of(request, area, epoch, z, x, y)
 
     @app.get("/v1/forecast", tags=["Compatibilité Open-Meteo"])
     async def proxy_open_meteo_forecast(request: Request) -> JSONResponse:

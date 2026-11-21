@@ -1,4 +1,4 @@
-"""Mosaïque radar Météo-France (lame d'eau de la métropole) : téléchargement toutes les 5 minutes et images gardées.
+"""Mosaïques radar Météo-France (lame d'eau : métropole, Antilles, Réunion, Nouvelle-Calédonie) : téléchargement toutes les 5 minutes et images gardées.
 
 L'API `DPRadar` ne rend que la dernière image (pas d'historique) : la passerelle la lit dès qu'une nouvelle est
 publiée (la date de fin des 5 minutes de cumul, `validity_time`, se lit dans un petit document JSON avant le fichier de
@@ -6,7 +6,8 @@ publiée (la date de fin des 5 minutes de cumul, `validity_time`, se lit dans un
 Relevé le 18/11/2026 : l'image qui finit à 08 h 25 était publiée à 08 h 27.
 
 Deux processus servent l'API : un verrou de fichier (`fcntl`, absent sous Windows) évite qu'ils téléchargent chacun.
-Quota de l'API : 850 requêtes / 5 min (DPRadar) ; ici deux requêtes toutes les 5 minutes.
+Quota de l'API : 850 requêtes / 5 min (DPRadar) ; ici deux requêtes toutes les 5 minutes et par zone (un collecteur par zone,
+chacun avec son dossier : `radar/` pour la métropole, `radar/<zone>/` pour les autres).
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import httpx
 import numpy as np
 
 from app.config import Settings, redact_secret
-from app.radar_grid import SIZE, RadarFrame, decode_hdf5
+from app.radar_grid import METROPOLE, RadarArea, RadarFrame, decode_hdf5
 
 try:  # pragma: no cover - dépend du système
     import fcntl
@@ -47,8 +48,9 @@ FRESH_WITHIN_S = 900
 class RadarStore:
     """Les images sur disque (une par fin de cumul, en classes d'intensité compressées) et les dernières en mémoire."""
 
-    def __init__(self, directory: str | Path, keep_seconds: int, memory_frames: int = 2) -> None:
+    def __init__(self, directory: str | Path, keep_seconds: int, memory_frames: int = 2, area: RadarArea = METROPOLE) -> None:
         self.directory = Path(directory)
+        self.area = area
         self.keep_seconds = keep_seconds
         self._memory: OrderedDict[int, RadarFrame] = OrderedDict()
         self._memory_frames = memory_frames
@@ -82,10 +84,12 @@ class RadarStore:
             raw = zlib.decompress(path.read_bytes())
         except (FileNotFoundError, zlib.error):
             return None
-        if len(raw) != SIZE * SIZE:
+        if len(raw) != self.area.rows * self.area.cols:
             return None
         frame = RadarFrame(
-            end=datetime.fromtimestamp(epoch, tz=UTC), classes=np.frombuffer(raw, dtype=np.uint8).reshape(SIZE, SIZE)
+            end=datetime.fromtimestamp(epoch, tz=UTC),
+            classes=np.frombuffer(raw, dtype=np.uint8).reshape(self.area.rows, self.area.cols),
+            area=self.area,
         )
         self._memory[epoch] = frame
         while len(self._memory) > self._memory_frames:
@@ -142,9 +146,12 @@ def parse_validity(doc: object) -> int:
 class RadarCollector:
     """Lit la mosaïque quand une nouvelle image est publiée."""
 
-    def __init__(self, client: httpx.AsyncClient, store: RadarStore, settings: Settings) -> None:
+    def __init__(self, client: httpx.AsyncClient, store: RadarStore, settings: Settings, area: RadarArea = METROPOLE) -> None:
         self._client = client
         self.store = store
+        self.area = area
+        # L'adresse de la métropole est réglable (`METEOFRANCE_RADAR_URL`) ; les autres zones n'en changent que le nom de la zone.
+        self._url = settings.radar_observation_url.replace(f"/mosaiques/{METROPOLE.dpradar}/", f"/mosaiques/{area.dpradar}/")
         self._settings = settings
         self.last_success_at: float | None = None
         self.last_error: str | None = None
@@ -174,7 +181,7 @@ class RadarCollector:
                 return await self._fetch_new(now)
             except Exception as exc:  # une panne de la source ne doit jamais sortir de la tâche de fond
                 self.last_error = redact_secret(f"{type(exc).__name__}: {exc}", self._settings)[:300]
-                log.warning("radar : %s", self.last_error)
+                log.warning("radar %s : %s", self.area.slug, self.last_error)
                 return False
 
     async def _fetch_new(self, now: float) -> bool:
@@ -184,17 +191,17 @@ class RadarCollector:
             "User-Agent": self._settings.user_agent,
         }
         timeout = self._settings.http_timeout_seconds
-        doc = await self._client.get(self._settings.radar_observation_url, headers=headers, timeout=timeout)
+        doc = await self._client.get(self._url, headers=headers, timeout=timeout)
         doc.raise_for_status()
         newest = parse_validity(doc.json())
         epochs = self.store.epochs()
         if epochs and newest <= epochs[-1]:
             return False  # pas encore de nouvelle image : on redemandera dans 45 s
         resp = await self._client.get(
-            f"{self._settings.radar_observation_url}/produit", params={"maille": 500}, headers=headers, timeout=60.0
+            f"{self._url}/produit", params={"maille": 500}, headers=headers, timeout=60.0
         )
         resp.raise_for_status()
-        frame = decode_hdf5(resp.content)
+        frame = decode_hdf5(resp.content, self.area)
         self.store.save(frame)
         self.store.purge(now)
         self.last_success_at = now

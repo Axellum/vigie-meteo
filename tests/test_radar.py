@@ -21,6 +21,7 @@ from app.collectors.radar import FIRST_TRY_AFTER_S, RadarCollector, RadarStore, 
 from app.config import Settings
 from app.main import create_app
 from app.radar_grid import (
+    AREAS,
     PIXEL_M,
     SIZE,
     TILE,
@@ -33,7 +34,7 @@ from app.radar_grid import (
     project,
     tile_png,
 )
-from tests.radar_h5 import PROJDEF, make_h5
+from tests.radar_h5 import PROJDEF, PROJDEFS, make_h5
 
 END = datetime(2026, 11, 18, 8, 25, tzinfo=UTC)
 EPOCH = int(END.timestamp())
@@ -303,3 +304,158 @@ def check_with_image(client: TestClient) -> None:
     assert client.get(f"/v1/radar/tiles/{EPOCH}/11/0/0.png").status_code == 404
     health = client.get("/v1/health").json()["sources"]["meteofrance-radar"]
     assert health["provider"] == "meteofrance-radar"
+
+
+# ------------------------------------------------------------------------------------------------ zones d'outre-mer
+# Fichiers `LAME_D_EAU` des mosaïques ANTILLES, REUNION et NOUVELLE-CALEDONIE lus le 21/11/2026 (Mercator, grilles rectangulaires).
+
+OVERSEAS = [
+    # slug, coins (lat, lon) lus dans `where` du vrai fichier : UL, UR, LL, LR ; un point dans la zone vue par les radars
+    (
+        "antilles",
+        {
+            "UL": (21.0, -66.0),
+            "UR": (20.99999999999914, -57.006187389821896),
+            "LL": (10.594135757192138, -65.99999999999999),
+            "LR": (10.594135757192138, -57.006187389821896),
+        },
+        (14.65, -61.0),  # Martinique
+    ),
+    (
+        "reunion",
+        {
+            "UL": (-16.0, 51.0),
+            "UR": (-15.99999999999907, 62.01648998117064),
+            "LL": (-25.013510674875672, 50.99999999999999),
+            "LR": (-25.013510674875672, 62.01648998117064),
+        },
+        (-21.1, 55.5),  # La Réunion
+    ),
+    (
+        "new-caledonia",
+        {
+            "UL": (-16.2, 159.7),
+            "UR": (-16.19999999999907, 171.57012385556823),
+            "LL": (-27.267467681253866, 159.7),
+            "LR": (-27.267467681253866, 171.57012385556823),
+        },
+        (-22.27, 166.45),  # Nouméa
+    ),
+]
+
+
+@pytest.mark.parametrize(("slug", "corners", "place"), OVERSEAS)
+def test_overseas_projection_reproduces_the_four_corners_of_the_real_file(slug: str, corners: dict, place: tuple) -> None:
+    area = AREAS[slug]
+    expected = {"UL": (0.0, area.top_m), "UR": (area.cols * PIXEL_M, area.top_m), "LL": (0.0, 0.0), "LR": (area.cols * PIXEL_M, 0.0)}
+    for corner, (lat, lon) in corners.items():
+        px, py = area.project(lat, lon)
+        assert float(px) == pytest.approx(expected[corner][0], abs=0.05)
+        assert float(py) == pytest.approx(expected[corner][1], abs=0.05)
+    west, south, east, north = area.bounds  # the box served is the box of the file, widened by at most 0.02 degree
+    assert west == pytest.approx(corners["UL"][1], abs=0.02) and east == pytest.approx(corners["UR"][1], abs=0.02)
+    assert north == pytest.approx(corners["UL"][0], abs=0.02) and south == pytest.approx(corners["LL"][0], abs=0.02)
+
+
+@pytest.mark.parametrize(("slug", "corners", "place"), OVERSEAS)
+def test_overseas_decode_refuses_another_zones_file_and_reads_its_own(slug: str, corners: dict, place: tuple) -> None:
+    area = AREAS[slug]
+    data = np.zeros((area.rows, area.cols), dtype=np.uint16)
+    data[10, 20] = 1000
+    frame = decode_hdf5(make_h5(data, projdef=PROJDEFS[slug], area=area), area)
+    assert frame.area is area and frame.classes.shape == (area.rows, area.cols) and frame.classes[10, 20] == 9
+    other = AREAS["reunion" if slug != "reunion" else "antilles"]
+    with pytest.raises(ValueError, match="projection"):
+        decode_hdf5(make_h5(projdef=PROJDEFS[slug], area=area), other)
+    with pytest.raises(ValueError, match="projection"):
+        decode_hdf5(make_h5(area=area), area)  # the metropolitan projdef is not the one of the area
+
+
+@pytest.mark.parametrize(("slug", "corners", "place"), OVERSEAS)
+@pytest.mark.parametrize("zoom", [5, 7, 9])
+def test_overseas_tile_puts_the_rain_where_it_is(slug: str, corners: dict, place: tuple, zoom: int) -> None:
+    area = AREAS[slug]
+    classes = np.zeros((area.rows, area.cols), dtype=np.uint8)
+    x, y = area.project(*place)
+    col, row = int(x // PIXEL_M), int((area.top_m - y) // PIXEL_M)
+    classes[row - 6 : row + 7, col - 6 : col + 7] = 5
+    frame = RadarFrame(end=END, classes=classes, area=area)
+    tx, ty, px, py = place_in_tile(*place, zoom)
+    image = read_png(tile_png(frame, zoom, tx, ty))
+    assert image[py, px] == 5
+    assert image.max() == 5 and (image == 5).sum() < TILE * TILE // 2  # a patch of 7 km, not the whole tile
+    # a tile on the other side of the Earth does not touch the grid
+    assert tile_png(frame, 7, (tx * 2 ** (7 - zoom) + 64) % 128, 60) == TRANSPARENT_TILE
+
+
+def test_a_grid_that_is_not_a_multiple_of_the_pooling_factor_keeps_its_edge() -> None:
+    area = AREAS["antilles"]  # 2310 x 1930: neither is a multiple of 8
+    classes = np.zeros((area.rows, area.cols), dtype=np.uint8)
+    classes[-1, -1] = 7
+    classes[0, 0] = 3
+    frame = RadarFrame(end=END, classes=classes, area=area)
+    for factor in (2, 4, 8):
+        pooled = frame.pooled(factor)
+        assert pooled.shape == (-(-area.rows // factor), -(-area.cols // factor))
+        assert pooled[-1, -1] == 7 and pooled[0, 0] == 3
+
+
+def test_store_of_an_overseas_area_keeps_its_shape(tmp_path: Path) -> None:
+    area = AREAS["reunion"]
+    store = RadarStore(tmp_path / "reunion", keep_seconds=3600, area=area)
+    classes = np.zeros((area.rows, area.cols), dtype=np.uint8)
+    classes[5, 6] = 4
+    store.save(RadarFrame(end=END, classes=classes, area=area))
+    loaded = store.load(EPOCH)
+    assert loaded is not None and loaded.area is area and loaded.classes[5, 6] == 4
+    # an image of another grid (the metropolitan one) is not an image of this area
+    other = RadarStore(tmp_path / "reunion", keep_seconds=3600)
+    assert other.load(EPOCH) is None
+
+
+async def test_the_collector_of_an_overseas_area_asks_its_own_zone(tmp_path: Path) -> None:
+    area = AREAS["antilles"]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/produit"):
+            return httpx.Response(200, content=make_h5(projdef=PROJDEFS["antilles"], area=area))
+        return httpx.Response(200, json=doc("2026-11-18T08:25:00Z"))
+
+    settings = Settings(METEO_DB_PATH=str(tmp_path / "c.db"), METEOFRANCE_API_KEY="secret-mf-token-123")
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    collector = RadarCollector(client, RadarStore(tmp_path / "antilles", 3600, area=area), settings, area)
+    assert await collector.refresh(now=EPOCH + 150) is True
+    assert calls == [
+        "/public/DPRadar/v1/mosaiques/ANTILLES/observations/LAME_D_EAU",
+        "/public/DPRadar/v1/mosaiques/ANTILLES/observations/LAME_D_EAU/produit",
+    ]
+    assert collector.store.epochs() == [EPOCH]
+
+
+def test_routes_serve_the_overseas_areas_and_keep_the_old_ones(tmp_path: Path) -> None:
+    with api_client(tmp_path) as client:
+        assert client.get("/v1/radar/atlantis/frames").status_code == 404
+        assert client.get("/v1/radar/antilles/frames").status_code == 503  # nothing downloaded yet
+        area = AREAS["antilles"]
+        classes = np.zeros((area.rows, area.cols), dtype=np.uint8)
+        x, y = area.project(14.65, -61.0)
+        col, row = int(x // PIXEL_M), int((area.top_m - y) // PIXEL_M)
+        classes[row - 8 : row + 9, col - 8 : col + 9] = 6
+        client.app.state.radars["antilles"].store.save(RadarFrame(end=END, classes=classes, area=area))
+        body = client.get("/v1/radar/antilles/frames").json()
+        assert body["area"] == "antilles" and [f["epoch"] for f in body["frames"]] == [EPOCH]
+        assert body["tile_path"] == "/v1/radar/antilles/tiles/{epoch}/{z}/{x}/{y}.png"
+        assert body["bounds"][0] == -66.0 and body["bounds"][3] == 21.0
+        tx, ty, px, py = place_in_tile(14.65, -61.0, 8)
+        tile = client.get(f"/v1/radar/antilles/tiles/{EPOCH}/8/{tx}/{ty}.png")
+        assert tile.status_code == 200 and read_png(tile.content)[py, px] == 6
+        # the metropolitan routes are untouched, and do not serve the Antilles' image
+        assert client.get("/v1/radar/frames").status_code == 503
+        assert client.get(f"/v1/radar/tiles/{EPOCH}/8/{tx}/{ty}.png").status_code == 404
+        assert client.get("/v1/radar/france/frames").status_code == 503
+        sources = client.get("/v1/health").json()["sources"]
+        assert sources["meteofrance-radar-antilles"]["status"] in ("fresh", "stale")
+        for name in ("meteofrance-radar", "meteofrance-radar-reunion", "meteofrance-radar-new-caledonia"):
+            assert sources[name]["status"] == "unavailable"

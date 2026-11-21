@@ -126,8 +126,9 @@ class RadarLegendClass(BaseModel):
 
 
 class RadarFramesResponse(BaseModel):
-    """Les images radar gardées (`GET /v1/radar/frames`), de la plus ancienne à la plus récente."""
+    """Les images radar gardées (`GET /v1/radar/{area}/frames`), de la plus ancienne à la plus récente."""
 
+    area: str = Field(default="france", description="La zone : `france` (métropole), `antilles`, `reunion` ou `new-caledonia`.")
     source_model: str
     attribution: str
     interval_minutes: int = 5

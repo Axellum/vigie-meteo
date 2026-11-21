@@ -9,6 +9,11 @@ reproduit les quatre coins du fichier à 4 mm près (`tests/test_radar_grid.py`)
 
 La carte est gardée sous forme de classes d'intensité (octet par pixel), pas en mm : c'est tout ce que la tuile montre.
 Pas de h5py hors de ce module, pas de pyproj : la projection est écrite ici (numpy).
+
+Trois mosaïques d'outre-mer (`ANTILLES`, `REUNION`, `NOUVELLE-CALEDONIE`, fichiers lus le 21/11/2026) ont le même format
+HDF5 (`ACRR` 0,01 mm, 500 m, `65535` hors portée) mais une grille rectangulaire en projection **Mercator** (`+proj=merc
++lat_ts=...` avec fausse origine : le coin haut-gauche est à (0 ; hauteur) comme en métropole). Chaque zone est décrite par un
+`RadarArea` ; les fonctions prennent la zone de l'image (par défaut la métropole, comme avant).
 """
 
 from __future__ import annotations
@@ -16,14 +21,16 @@ from __future__ import annotations
 import io
 import struct
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 import numpy as np
 
-SIZE = 3472
+SIZE = 3472  # grille de la métropole (carrée) ; les autres zones ont leur `RadarArea.rows` / `cols`
 PIXEL_M = 500.0
-TOP_M = SIZE * PIXEL_M  # ordonnée du bord haut de l'image (le bord gauche est à x = 0)
+TOP_M = SIZE * PIXEL_M  # ordonnée du bord haut de l'image de la métropole (le bord gauche est à x = 0)
 EXPECTED_PROJ = ("+proj=stere", "+lat_0=90", "+lon_0=0", "+lat_ts=45", "+ellps=WGS84", "+x_0=619652.07", "+y_0=5262818.34")
 UNDETECT = 65534
 NODATA = 65535
@@ -85,6 +92,82 @@ def project(lat: np.ndarray | float, lon: np.ndarray | float) -> tuple[np.ndarra
     return _X0 + rho * np.sin(lam), _Y0 - rho * np.cos(lam)
 
 
+@dataclass(frozen=True)
+class RadarArea:
+    """Une mosaïque de DPRadar : son nom chez Météo-France, sa grille, sa projection et sa boîte."""
+
+    slug: str  # le nom dans nos adresses (`/v1/radar/{slug}/...`)
+    dpradar: str  # le nom de la zone dans l'API DPRadar
+    rows: int
+    cols: int
+    bounds: tuple[float, float, float, float]  # ouest, sud, est, nord (degrés)
+    ref_lat: float  # latitude où l'on calcule la taille d'un pixel d'écran (réduction de l'image)
+    project: Callable[[Any, Any], tuple[Any, Any]]
+    expected_proj: tuple[str, ...]
+
+    @property
+    def top_m(self) -> float:
+        return self.rows * PIXEL_M
+
+
+def mercator(lat_ts: float, x0: float, y0: float) -> Callable[[Any, Any], tuple[Any, Any]]:
+    """La projection Mercator ellipsoïdale à latitude d'échelle vraie `lat_ts` (`+proj=merc`) et fausse origine (`x0`, `y0`)."""
+    phi_ts = np.radians(lat_ts)
+    k0 = np.cos(phi_ts) / np.sqrt(1 - (_E * np.sin(phi_ts)) ** 2)
+
+    def project_mercator(lat: Any, lon: Any) -> tuple[Any, Any]:
+        phi = np.radians(lat)
+        sin_phi = np.sin(phi)
+        psi = np.arcsinh(np.tan(phi)) - _E * np.arctanh(_E * sin_phi)
+        return x0 + _A * k0 * np.radians(lon), y0 + _A * k0 * psi
+
+    return project_mercator
+
+
+METROPOLE = RadarArea(
+    slug="france",
+    dpradar="METROPOLE",
+    rows=SIZE,
+    cols=SIZE,
+    bounds=BOUNDS,
+    ref_lat=46.5,
+    project=project,
+    expected_proj=EXPECTED_PROJ,
+)
+# Fichiers lus le 21/11/2026 (`where/projdef`, `xsize`, `ysize`, coins `UL_lat`...) ; `bounds` = (UL_lon, LL_lat, UR_lon, UL_lat).
+ANTILLES = RadarArea(
+    slug="antilles",
+    dpradar="ANTILLES",
+    rows=2310,
+    cols=1930,
+    bounds=(-66.0, 10.59, -57.0, 21.0),
+    ref_lat=16.0,
+    project=mercator(15.501, 7081535.14, -1135674.47),
+    expected_proj=("+proj=merc", "+lat_ts=15.501", "+x_0=7081535.14", "+y_0=-1135674.47"),
+)
+REUNION = RadarArea(
+    slug="reunion",
+    dpradar="REUNION",
+    rows=2000,
+    cols=2300,
+    bounds=(51.0, -25.02, 62.02, -16.0),
+    ref_lat=-20.5,
+    project=mercator(-20.387, -5323837.27, 2681326.18),
+    expected_proj=("+proj=merc", "+lat_ts=-20.387", "+x_0=-5323837.27", "+y_0=2681326.18"),
+)
+NOUVELLE_CALEDONIE = RadarArea(
+    slug="new-caledonia",
+    dpradar="NOUVELLE-CALEDONIE",
+    rows=2528,
+    cols=2528,
+    bounds=(159.7, -27.27, 171.58, -16.2),
+    ref_lat=-22.0,
+    project=mercator(-17.0, -17005787.17, 3001128.55),
+    expected_proj=("+proj=merc", "+lat_ts=-17", "+x_0=-17005787.17", "+y_0=3001128.55"),
+)
+AREAS: dict[str, RadarArea] = {a.slug: a for a in (METROPOLE, ANTILLES, REUNION, NOUVELLE_CALEDONIE)}
+
+
 def classify(values: np.ndarray) -> np.ndarray:
     """Classes d'intensité (octet) d'une image ACRR brute : 0 = pas de pluie ou hors couverture, 1..9 = intensité croissante.
 
@@ -106,7 +189,8 @@ class RadarFrame:
     """Une image : la fin de ses 5 minutes de cumul et ses classes d'intensité."""
 
     end: datetime
-    classes: np.ndarray  # uint8, (SIZE, SIZE)
+    classes: np.ndarray  # uint8, (area.rows, area.cols)
+    area: RadarArea = METROPOLE
     _pools: dict[int, np.ndarray] = field(default_factory=dict, repr=False)
 
     @property
@@ -120,8 +204,13 @@ class RadarFrame:
         if factor not in (2, 4, 8):
             raise ValueError("facteur de réduction inconnu")
         if factor not in self._pools:
-            n = SIZE // factor
-            self._pools[factor] = self.classes.reshape(n, factor, n, factor).max(axis=(1, 3))
+            rows, cols = self.classes.shape
+            padded_rows, padded_cols = -(-rows // factor) * factor, -(-cols // factor) * factor
+            image = self.classes
+            if (padded_rows, padded_cols) != (rows, cols):  # une grille qui n'est pas un multiple du facteur : bord complété de zéros
+                image = np.zeros((padded_rows, padded_cols), dtype=np.uint8)
+                image[:rows, :cols] = self.classes
+            self._pools[factor] = image.reshape(padded_rows // factor, factor, padded_cols // factor, factor).max(axis=(1, 3))
         return self._pools[factor]
 
 
@@ -130,8 +219,8 @@ def _text(value: object) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
-def decode_hdf5(content: bytes) -> RadarFrame:
-    """L'image d'un fichier mosaïque `LAME_D_EAU` à 500 m. `ValueError` si le fichier n'est pas celui qu'on sait lire."""
+def decode_hdf5(content: bytes, area: RadarArea = METROPOLE) -> RadarFrame:
+    """L'image d'un fichier mosaïque `LAME_D_EAU` à 500 m de cette zone. `ValueError` si le fichier n'est pas celui qu'on sait lire."""
     import h5py  # import tardif : la bibliothèque est lourde et seul ce chemin s'en sert
 
     try:
@@ -142,9 +231,9 @@ def decode_hdf5(content: bytes) -> RadarFrame:
         try:
             where = f["where"].attrs
             proj = _text(where["projdef"])
-            if any(token not in proj for token in EXPECTED_PROJ):
+            if any(token not in proj for token in area.expected_proj):
                 raise ValueError(f"projection inattendue : {proj[:120]}")
-            if int(where["xsize"]) != SIZE or int(where["ysize"]) != SIZE or float(where["xscale"]) != PIXEL_M:
+            if int(where["xsize"]) != area.cols or int(where["ysize"]) != area.rows or float(where["xscale"]) != PIXEL_M:
                 raise ValueError("grille inattendue (taille ou pas)")
             what = f["dataset1/data1/what"].attrs
             quantity = _text(what["quantity"])
@@ -157,9 +246,9 @@ def decode_hdf5(content: bytes) -> RadarFrame:
             data = f["dataset1/data1/data"][:]
         except KeyError as exc:
             raise ValueError(f"champ absent du fichier : {exc}") from exc
-    if data.shape != (SIZE, SIZE) or data.dtype != np.uint16:
+    if data.shape != (area.rows, area.cols) or data.dtype != np.uint16:
         raise ValueError("image inattendue")
-    return RadarFrame(end=end, classes=classify(data))
+    return RadarFrame(end=end, classes=classify(data), area=area)
 
 
 # ------------------------------------------------------------------------------------------------ tuiles
@@ -189,9 +278,9 @@ def encode_png(indexed: np.ndarray) -> bytes:
 TRANSPARENT_TILE = encode_png(np.zeros((TILE, TILE), dtype=np.uint8))
 
 
-def pool_factor(zoom: int) -> int:
-    """Le facteur de réduction de l'image à ce zoom : un pixel d'écran vaut 1 à 8 pixels de 500 m (calculé à 46,5° N)."""
-    metres_per_pixel = 156543.03 * np.cos(np.radians(46.5)) / (2**zoom)
+def pool_factor(zoom: int, ref_lat: float = 46.5) -> int:
+    """Le facteur de réduction de l'image à ce zoom : un pixel d'écran vaut 1 à 8 pixels de 500 m (calculé à la latitude de la zone)."""
+    metres_per_pixel = 156543.03 * np.cos(np.radians(ref_lat)) / (2**zoom)
     for factor, limit in ((1, 1000.0), (2, 2000.0), (4, 4000.0)):
         if metres_per_pixel < limit:
             return factor
@@ -207,17 +296,18 @@ def tile_png(frame: RadarFrame, z: int, x: int, y: int) -> bytes:
     lon = (x + steps) / n * 360.0 - 180.0
     lat = np.degrees(np.arctan(np.sinh(np.pi * (1.0 - 2.0 * (y + steps) / n))))
     lon_grid, lat_grid = np.meshgrid(lon, lat)
-    px, py = project(lat_grid, lon_grid)
-    factor = pool_factor(z)
+    area = frame.area
+    px, py = area.project(lat_grid, lon_grid)
+    factor = pool_factor(z, area.ref_lat)
     cell = PIXEL_M * factor
     col = np.floor(px / cell).astype(np.int64)
-    row = np.floor((TOP_M - py) / cell).astype(np.int64)
-    limit = SIZE // factor
-    inside = (col >= 0) & (col < limit) & (row >= 0) & (row < limit)
+    row = np.floor((area.top_m - py) / cell).astype(np.int64)
+    pooled = frame.pooled(factor)
+    inside = (col >= 0) & (col < pooled.shape[1]) & (row >= 0) & (row < pooled.shape[0])
     if not inside.any():
         return TRANSPARENT_TILE
     image = np.zeros((TILE, TILE), dtype=np.uint8)
-    image[inside] = frame.pooled(factor)[row[inside], col[inside]]
+    image[inside] = pooled[row[inside], col[inside]]
     if not image.any():
         return TRANSPARENT_TILE
     return encode_png(image)

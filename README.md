@@ -27,16 +27,18 @@ C'est la source météo interne de [Vigie](https://github.com/Axellum/vigie-api)
 | `GET /v1/station-daily?station=59343001&days=7` | Derniers jours mesurés par une station Météo-France (température minimale et maximale, pluie, vent moyen, rafale ; DPClim) : une commande par station et par jour au plus, hier après 11 h 30 UTC, 503 si le portail ne répond pas : lue par Vigie |
 | `GET /v1/forests?department=11` | Météo des forêts (danger de feux de forêt par département, niveaux 1 à 4, J+1 et J+2) : `status` `available` de juin à septembre, `out_of_season` sinon : lue par Vigie |
 | `GET /v1/probabilities?lat=48.85&lon=2.35` | Probabilités des prévisions d'ensemble de Météo-France : PE-AROME (tranches de 3 h jusqu'à +51 h : pluie ≥ 1 et 5 mm, neige, rafales, grêle, orage) et PE-ARPEGE (24 h jusqu'à +96 h : pluie ≥ 1, 5, 10 et 20 mm), les cartes du dernier run en mémoire ; 404 hors de la métropole et de la Corse, 503 sans run récent des deux |
-| `GET /v1/radar/frames` | Images de la mosaïque radar Météo-France (lame d'eau, métropole, une toutes les 5 min, 3 h gardées) : dates, zone couverte, modèle de chemin des tuiles |
-| `GET /v1/radar/tiles/{epoch}/{z}/{x}/{y}.png` | Tuile PNG 256 px (Web Mercator, zooms 3 à 10) d'une image radar, classes d'intensité en couleurs, transparente sans pluie ; l'adresse porte la date de l'image : réponse immuable |
+| `GET /v1/radar/frames` | Images de la mosaïque radar Météo-France (lame d'eau, métropole, une toutes les 5 min, 3 h gardées) : dates, zone couverte, modèle de chemin des tuiles (= `/v1/radar/france/frames`) |
+| `GET /v1/radar/{area}/frames` | La même chose pour une zone : `france`, `antilles`, `reunion` ou `new-caledonia` (404 sinon, 503 sans image) |
+| `GET /v1/radar/tiles/{epoch}/{z}/{x}/{y}.png` | Tuile PNG 256 px (Web Mercator, zooms 3 à 10) d'une image radar de la métropole, classes d'intensité en couleurs, transparente sans pluie ; l'adresse porte la date de l'image : réponse immuable |
+| `GET /v1/radar/{area}/tiles/{epoch}/{z}/{x}/{y}.png` | La même chose pour une zone d'outre-mer (ou `france`) |
 | `GET /v1/health` | État de la base SQLite et des circuits breakers |
 
 ### Radar (lame d'eau)
 
-`DPRadar/v1` (mosaïque `METROPOLE`, observation `LAME_D_EAU`, maille 500 m, HDF5) ne rend que la dernière image : une tâche de fond la lit
+`DPRadar/v1` (mosaïques `METROPOLE`, `ANTILLES`, `REUNION` et `NOUVELLE-CALEDONIE`, observation `LAME_D_EAU`, maille 500 m, HDF5) ne rend que la dernière image de chaque zone : une tâche de fond la lit
 dès qu'une nouvelle est publiée (date lue dans un petit document JSON avant le fichier de 2 Mo), la range sur disque (`radar/` à côté
 de la base, ~230 Ko par image, `METEO_RADAR_KEEP_MINUTES`, 180 par défaut) et les tuiles sont calculées à la demande
-(`app/radar_grid.py` : projection stéréographique polaire écrite en numpy, pas de pyproj). `METEO_RADAR_ENABLED=0` coupe la tâche.
+(`app/radar_grid.py` : projection stéréographique polaire de la métropole et Mercator des trois zones d'outre-mer, écrites en numpy, pas de pyproj ; une zone a son dossier `radar/<zone>/`, la métropole garde `radar/`). Deux requêtes toutes les 5 minutes par zone, soit 8 pour les quatre. `METEO_RADAR_ENABLED=0` coupe les tâches, `METEO_RADAR_AREAS` (défaut `france,antilles,reunion,new-caledonia`) choisit les zones lues.
 Source : Météo-France, Licence Ouverte 2.0 (jeu « Package Radar » de data.gouv.fr) ; crédit dans `/v1/radar/frames`.
 
 ### AROME-PI (grêle, rafales, visibilité, type de précipitation)
