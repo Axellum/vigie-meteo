@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     )
     radar_dir: str | None = Field(default=None, alias="METEO_RADAR_DIR")  # défaut : `radar/` à côté de la base SQLite
     radar_keep_minutes: int = Field(default=180, ge=15, le=1440, alias="METEO_RADAR_KEEP_MINUTES")
+    # Les mosaïques lues (noms de nos adresses, séparés par des virgules) : la métropole et les trois zones d'outre-mer de DPRadar.
+    radar_areas: str = Field(default="france,antilles,reunion,new-caledonia", alias="METEO_RADAR_AREAS")
 
     # AROME-PI (prévision immédiate, WCS `aromepi/1.0`) : grêle, rafales, visibilité et type de précipitation, 24 échéances de 15 min.
     # Un run par heure, publié ~20 min après son heure (relevé le 18/11/2026) ; une échéance par requête (96 requêtes par run).

@@ -5,7 +5,7 @@ from __future__ import annotations
 import h5py
 import numpy as np
 
-from app.radar_grid import SIZE
+from app.radar_grid import METROPOLE, RadarArea
 
 PROJDEF = b"+proj=stere +lat_0=90 +lon_0=0 +lat_ts=45 +ellps=WGS84 +x_0=619652.07 +y_0=5262818.34 +datum=WGS84 +units=m +no_defs"
 
@@ -15,14 +15,15 @@ def make_h5(
     end: tuple[str, str] = ("20261118", "082500"),
     projdef: bytes = PROJDEF,
     quantity: bytes = b"ACRR",
+    area: RadarArea = METROPOLE,
 ) -> bytes:
     """Les octets d'un fichier `LAME_D_EAU` à 500 m ; `data` vaut « sec partout » (0) par défaut."""
-    image = np.zeros((SIZE, SIZE), dtype=np.uint16) if data is None else data
+    image = np.zeros((area.rows, area.cols), dtype=np.uint16) if data is None else data
     f = h5py.File("mosaique.h5", "w", driver="core", backing_store=False)
     where = f.create_group("where")
     where.attrs["projdef"] = projdef
-    where.attrs["xsize"] = SIZE
-    where.attrs["ysize"] = SIZE
+    where.attrs["xsize"] = area.cols
+    where.attrs["ysize"] = area.rows
     where.attrs["xscale"] = 500.0
     where.attrs["yscale"] = 500.0
     what = f.create_group("dataset1/data1/what")
@@ -39,3 +40,11 @@ def make_h5(
     raw = f.id.get_file_image()
     f.close()
     return raw
+
+
+# `where/projdef` des trois zones d'outre-mer, relevés dans les fichiers du 21/11/2026.
+PROJDEFS = {
+    "antilles": b"+proj=merc +lat_0=0 +lon_0=0 +lat_ts=15.501 +ellps=WGS84 +datum=WGS84 +x_0=7081535.14 +y_0=-1135674.47 ",
+    "reunion": b"+proj=merc +lat_0=0 +lon_0=0 +lat_ts=-20.387 +ellps=WGS84 +datum=WGS84 +x_0=-5323837.27 +y_0=2681326.18 ",
+    "new-caledonia": b"+proj=merc +lat_0=0 +lon_0=0 +lat_ts=-17 +ellps=WGS84 +datum=WGS84 +x_0=-17005787.17 +y_0=3001128.55 ",
+}
