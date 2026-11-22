@@ -69,6 +69,7 @@ def _opt_float(val: Any) -> float | None:
 
 
 PIAF_SOURCE_MODEL = "meteofrance-piaf"
+PIAF_ATTRIBUTION = "Source : Météo-France, prévision immédiate PIAF (portail-api.meteofrance.fr)"
 PIAF_STEP_SECONDS = 300
 PIAF_FORMAT = "application/wmo-grib"
 _PIAF_COVERAGE = "TOTAL_PRECIPITATION_RATE__GROUND_OR_WATER_SURFACE___{run}_PT5M"
@@ -124,6 +125,17 @@ class PiafRun:
         j, i = idx
         return [float(grid.values[j, i]) for grid in self.steps]
 
+    def step_time(self, index: int) -> datetime:
+        """Fin des 5 minutes de cumul (UTC) pour l'échéance `index` (0 = +5 min)."""
+        return self.run.astimezone(UTC) + timedelta(seconds=PIAF_STEP_SECONDS * (index + 1))
+
+    def step_for_epoch(self, epoch: int) -> LatLonGrid | None:
+        """La grille de l'échéance dont la fin de cumul vaut `epoch` (secondes UNIX UTC), ou None."""
+        for index, grid in enumerate(self.steps):
+            if int(self.step_time(index).timestamp()) == epoch:
+                return grid
+        return None
+
 
 class PiafOutsideError(LookupError):
     """Le point est hors de la carte PIAF (France métropolitaine) : ce n'est pas une panne de la source."""
@@ -139,6 +151,12 @@ class MeteoFranceNowcastCollector(_MeteoFranceAuthCollector):
         self._run: PiafRun | None = None
         self._lock = asyncio.Lock()
         self._refresh: asyncio.Task[None] | None = None
+
+    def current_run(self) -> PiafRun | None:
+        """Le run PIAF actuellement en mémoire (sans requête réseau), ou None s'il n'est pas encore chargé."""
+        if self._run is None or not self._run.steps:
+            return None
+        return self._run
 
     async def get_rain_nowcast(
         self,
