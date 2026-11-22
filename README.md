@@ -104,3 +104,35 @@ Source : Météo-France, données climatologiques de base et Météo des forêts
    # Renseigner .env (METEOFRANCE_API_KEY, METEO_API_KEY) et Caddyfile (nom de domaine)
    docker compose up -d --build
    ```
+
+## Open-Meteo pour le monde entier (profil « monde »)
+
+En plus de la France, la pile peut servir Open-Meteo pour le monde entier (prévisions, probabilités, qualité de l'air),
+avec les mêmes données que l'API publique (seau `s3://openmeteo`, CC BY 4.0) et le même code (AGPLv3).
+
+Mesuré le 22/11/2026 sur une VM Ampere A1 (4 OCPU, 24 Go) :
+
+| | |
+|---|---|
+| Place sur le disque | ~83 Go (dont 10,5 Go de relief à 90 m) : un volume de 100 Go suffit |
+| Synchro en continu | ½ cœur, ~500 Mo de RAM ; un passage d'ECMWF 9 km prend ~25 min (disque à ~50 Mo/s) |
+| Débit de l'API | ~7 req/s à froid (lecture du disque), 790 à 840 req/s une fois en cache (4,5 Go de cache) |
+| Qualité | 0,99 °C d'écart moyen à 49 aéroports (METAR), contre 0,97 °C pour l'API publique |
+
+Mise en service :
+
+1. Créer un volume de bloc de 100 Go, le monter (par ex. `/mnt/om-monde`, ligne `nofail` dans `/etc/fstab`).
+   Jamais sur le disque de démarrage : le script refuse.
+2. Fichiers fixes, que la synchro n'apporte pas (relief, grilles d'ICON) :
+   ```bash
+   OM_WORLD_DATA=/mnt/om-monde/data ./monde_fichiers_fixes.sh
+   ```
+3. Démarrer le profil :
+   ```bash
+   OM_WORLD_DATA=/mnt/om-monde/data COMPOSE_PROFILES=monde docker compose up -d
+   ```
+4. Le port 8081 ne doit être ouvert qu'au tunnel du client (même règle que 8080) ; l'interface publique reste fermée.
+
+Les modèles gardés sont dans la commande de `open-meteo-world-sync`. ICON monde, UKMO monde et ARPEGE monde ont été
+retirés : ils prenaient 35 Go sans changer l'écart mesuré. Sans ICON Europe et D2, l'écart montait en Allemagne et en
+Suisse.
