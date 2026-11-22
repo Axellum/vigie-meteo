@@ -3,6 +3,8 @@
 # 1. open-meteo-sync : synchronise uniquement AROME HD + ARPEGE Europe (France)
 # 2. open-meteo      : moteur API Open-Meteo local (4 Go de cache RAM)
 # 3. meteo-api       : facade FastAPI unifiée sur le port 8000 (accessible via WireGuard 192.168.27.65:8000)
+# 4. et 5., profil « monde » seulement (COMPOSE_PROFILES=monde) : Open-Meteo pour le monde entier sur un disque à part
+#    (open-meteo-world-sync + open-meteo-world, port 8081). Voir « Open-Meteo pour le monde » dans le README.
 
 volumes:
   open_meteo_data:
@@ -49,6 +51,55 @@ services:
       resources:
         limits:
           memory: 5G
+
+  # --- Open-Meteo pour le monde entier (profil « monde ») ---------------------------------------------------------
+  # Données sur un disque à part, monté sur OM_WORLD_DATA (100 Go, ~83 Go utilisés, mesuré le 22/11/2026) : jamais sur
+  # le disque de démarrage. Les fichiers fixes (relief 90 m, grilles d'ICON) viennent de monde_fichiers_fixes.sh, pas de
+  # la synchro. Modèles gardés après mesure contre 49 aéroports : ECMWF IFS 9 km, GFS, probabilités GEFS et ECMWF, CAMS,
+  # ICON Europe et D2, et les régionaux HRRR, HRDPS, JMA, DMI, KNMI, MeteoSwiss (0,99 °C d'écart moyen, comme le jeu
+  # complet ; 0,97 °C pour l'API publique). ICON monde, UKMO monde et ARPEGE monde n'apportaient rien (35 Go de moins).
+  open-meteo-world-sync:
+    image: ghcr.io/open-meteo/open-meteo:latest
+    container_name: open-meteo-world-sync
+    profiles: ["monde"]
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: info
+      CACHE_SIZE: 2GB
+    volumes:
+      - ${OM_WORLD_DATA:-/mnt/om-monde/data}:/app/data
+    # --concurrent 2 : le disque plafonne vers 50 Mo/s, plus de téléchargements en parallèle n'iraient pas plus vite.
+    command: >
+      sync ecmwf_ifs,ncep_gfs013,ncep_gfs025,ncep_gefs025,ecmwf_ifs025_ensemble,cams_global,cams_europe,dwd_icon_eu,dwd_icon_d2,ncep_hrrr_conus,cmc_gem_hrdps,jma_msm,jma_gsm,dmi_harmonie_arome_europe,knmi_harmonie_arome_europe,meteoswiss_icon_ch1
+      temperature_2m,apparent_temperature,relative_humidity_2m,dew_point_2m,pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,wind_u_component_10m,wind_v_component_10m,wind_gusts_10m,precipitation,rain,showers,snowfall,snowfall_water_equivalent,weather_code,uv_index,uv_index_clear_sky,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,shortwave_radiation,direct_radiation,diffuse_radiation,cape,lifted_index,convective_inhibition,precipitation_probability,visibility,is_day,sunshine_duration,frozen_precipitation_percent,pm10,pm2_5,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide,dust,aerosol_optical_depth,european_aqi,us_aqi
+      --past-days 2 --repeat-interval 60 --concurrent 2
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  open-meteo-world:
+    image: ghcr.io/open-meteo/open-meteo:latest
+    container_name: open-meteo-world
+    profiles: ["monde"]
+    restart: unless-stopped
+    user: "0"
+    environment:
+      LOG_LEVEL: info
+      CACHE_SIZE: 4GB
+    volumes:
+      - ${OM_WORLD_DATA:-/mnt/om-monde/data}:/app/data:ro
+    command: ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
+    # Lu par Vigie (prévisions hors de France et qualité de l'air), par WireGuard seulement : DOCKER-USER bloque
+    # l'interface publique.
+    ports:
+      - "8081:8080"
+    # La limite compte aussi le cache disque : à 5 Go, 11 à 56 req/s (lecture du disque) ; à 14 Go, 840 req/s
+    # (mesuré le 22/11/2026 sur 2 000 points au hasard). 4,5 Go de cache suffisent pour 2 000 points.
+    deploy:
+      resources:
+        limits:
+          memory: 12G
 
   meteo-api:
     build:
