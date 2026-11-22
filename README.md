@@ -21,6 +21,8 @@ C'est la source météo interne de [Vigie](https://github.com/Axellum/vigie-api)
 | `GET /v1/weather?lat=48.85&lon=2.35` | Endpoint unifié (actuel, pluie 1h, horaire fusionné, journalier) |
 | `GET /v1/compact?lat=48.85&lon=2.35` | Payload condensé (< 4 Ko) pour ESP32 / LVGL / écrans domotiques |
 | `GET /v1/rain-nowcast?lat=48.85&lon=2.35` | Pluie dans l'heure PIAF (tranches de 5 min datées de leur fin ; repli AROME HD 15 min) : lue par Vigie |
+| `GET /v1/rain-nowcast/frames` | Échéances (+5 à +60 min, pas de 5 min) du run PIAF déjà en mémoire : heure du run, boîte France, légende et chemin des tuiles (503 sans run chargé) |
+| `GET /v1/rain-nowcast/tiles/{epoch}/{z}/{x}/{y}.png` | Tuile PNG 256 px (Web Mercator, zooms 3 à 10) d'une échéance PIAF en mémoire, même palette que le radar, transparente sans pluie ; 404 hors run ou hors zooms, 503 sans run chargé |
 | `GET /v1/forecast?...` | Proxy 100 % compatible avec la signature Open-Meteo ; avec `models=meteofrance_seamless` : AROME HD puis ARPEGE Europe, variable par variable (lu par Vigie pour la météo de la France) ; en-têtes `X-Cache-Status` (`fresh` ou `stale`) et `X-Cache-Age` |
 | `GET /v1/shortterm?lat=48.85&lon=2.35` | Grêle, rafales, visibilité et type de précipitation des prochaines heures (jusqu'à 6 h, pas de 15 min) du modèle AROME-PI de Météo-France : une carte de la France par run en mémoire, 404 hors de la métropole et de la Corse, 503 sans run récent : lue par Vigie |
 | `GET /v1/overseas?lat=14.6&lon=-61.0` | Prévision horaire AROME-OM de Météo-France pour un point d'outre-mer (température, humidité, vent, rafales, pression, nébulosité, pluie ; jusqu'à +48 h ; deux runs recollés) : 404 hors des fenêtres servies, 503 sans run récent : lue par Vigie |
@@ -40,6 +42,11 @@ dès qu'une nouvelle est publiée (date lue dans un petit document JSON avant le
 de la base, ~230 Ko par image, `METEO_RADAR_KEEP_MINUTES`, 180 par défaut) et les tuiles sont calculées à la demande
 (`app/radar_grid.py` : projection stéréographique polaire de la métropole et Mercator des trois zones d'outre-mer, écrites en numpy, pas de pyproj ; une zone a son dossier `radar/<zone>/`, la métropole garde `radar/`). Deux requêtes toutes les 5 minutes par zone, soit 8 pour les quatre. `METEO_RADAR_ENABLED=0` coupe les tâches, `METEO_RADAR_AREAS` (défaut `france,antilles,reunion,new-caledonia`) choisit les zones lues.
 Source : Météo-France, Licence Ouverte 2.0 (jeu « Package Radar » de data.gouv.fr) ; crédit dans `/v1/radar/frames`.
+
+### Tuiles pluie dans l'heure (PIAF +1 h)
+
+Les routes `/v1/rain-nowcast/frames` et `/v1/rain-nowcast/tiles/{epoch}/{z}/{x}/{y}.png` réutilisent directement les grilles PIAF (`PiafRun`, pas de 5 min jusqu'à +60 min) déjà gardées en mémoire pour `/v1/rain-nowcast` : aucune écriture disque et aucune requête supplémentaire vers le portail Météo-France. Les tuiles PNG 256 px (Web Mercator, zooms 3 à 10) sont rendues à la demande (`app/piaf_grid.py`) avec la même échelle d'intensité et la même palette que la mosaïque radar ; les deux routes répondent `503` tant qu'aucun run PIAF n'a été chargé en mémoire.
+Source : Météo-France, prévision immédiate PIAF (`portail-api.meteofrance.fr`) ; crédit dans `/v1/rain-nowcast/frames`.
 
 ### AROME-PI (grêle, rafales, visibilité, type de précipitation)
 

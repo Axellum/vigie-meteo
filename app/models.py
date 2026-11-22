@@ -140,6 +140,29 @@ class RadarFramesResponse(BaseModel):
     frames: list[RadarFrameInfo]
 
 
+class RainNowcastFrameInfo(BaseModel):
+    """Une échéance de la carte pluie dans l'heure PIAF (+5 à +60 min)."""
+
+    epoch: int = Field(..., description="Fin des 5 minutes de cumul en secondes UNIX UTC : adresse les tuiles.")
+    time_utc: datetime = Field(..., description="Fin des 5 minutes de cumul (ISO-8601 UTC).")
+    lead_minutes: int = Field(..., description="Échéance en minutes après l'heure du run (5, 10, …, 60).")
+
+
+class RainNowcastFramesResponse(BaseModel):
+    """Les échéances du run PIAF en mémoire (`GET /v1/rain-nowcast/frames`), de +5 min à +60 min."""
+
+    source_model: str = Field(..., description="Modèle source (`meteofrance-piaf`).")
+    run_utc: datetime = Field(..., description="Heure du run PIAF en mémoire (ISO-8601 UTC).")
+    bounds: list[float] = Field(..., description="Ouest, sud, est, nord (degrés WGS84) de la zone couverte.")
+    min_zoom: int = Field(..., description="Zoom Web Mercator minimal servi (3).")
+    max_zoom: int = Field(..., description="Zoom Web Mercator maximal servi (10).")
+    step_seconds: int = Field(..., description="Pas temporel entre deux échéances en secondes (300).")
+    tile_path: str = Field(..., description="Modèle de chemin d'une tuile PNG 256 px (Web Mercator) : `{epoch}`, `{z}`, `{x}`, `{y}`.")
+    legend: list[RadarLegendClass] = Field(..., description="Les classes d'intensité (identiques au radar), de la plus faible à la plus forte.")
+    frames: list[RainNowcastFrameInfo] = Field(..., description="Les échéances du run courant, par ordre chronologique.")
+    attribution: str = Field(..., description="Crédit obligatoire de la source Météo-France.")
+
+
 class ShortTermStep(BaseModel):
     """Une échéance de 15 minutes de la prévision immédiate AROME-PI : ce que le modèle prévoit sur les 15 minutes qui finissent à `time`."""
 

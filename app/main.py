@@ -39,7 +39,12 @@ from app.collectors.ensemble import (
 from app.collectors.forests import ATTRIBUTION as FORESTS_ATTRIBUTION
 from app.collectors.forests import SOURCE_MODEL as FORESTS_SOURCE_MODEL
 from app.collectors.forests import ForestsCollector
-from app.collectors.meteofrance import MeteoFranceNowcastCollector
+from app.collectors.meteofrance import (
+    PIAF_ATTRIBUTION,
+    PIAF_SOURCE_MODEL,
+    PIAF_STEP_SECONDS,
+    MeteoFranceNowcastCollector,
+)
 from app.collectors.open_meteo import OpenMeteoCollector
 from app.collectors.radar import ATTRIBUTION as RADAR_ATTRIBUTION
 from app.collectors.radar import FRESH_WITHIN_S, RadarCollector, RadarStore
@@ -60,12 +65,15 @@ from app.models import (
     RadarFramesResponse,
     RadarLegendClass,
     RainNowcastBlock,
+    RainNowcastFrameInfo,
+    RainNowcastFramesResponse,
     ShortTermResponse,
     ShortTermStep,
     SourceStatus,
     StationDailyResponse,
     UnifiedWeatherResponse,
 )
+from app.piaf_grid import grid_bounds, piaf_tile_png
 from app.radar_grid import AREAS, MAX_ZOOM, METROPOLE, MIN_ZOOM, legend, tile_png
 from app.security import ApiKeyMiddleware
 from app.services.weather import WeatherAggregatorService
@@ -369,6 +377,54 @@ def create_app(
         """Retourne la pluie dans l'heure officielle ou le repli AROME HD 15 min."""
         service: WeatherAggregatorService = request.app.state.weather_service
         return await service.get_rain_nowcast(lat=lat, lon=lon)
+
+    @app.get("/v1/rain-nowcast/frames", response_model=RainNowcastFramesResponse, tags=["Météo"])
+    async def get_rain_nowcast_frames(request: Request, response: Response) -> RainNowcastFramesResponse:
+        """Les échéances (+5 à +60 min) du run PIAF déjà en mémoire, pour afficher la pluie prévue en tuiles PNG."""
+        now_collector: MeteoFranceNowcastCollector = request.app.state.now_collector
+        run = now_collector.current_run()
+        if run is None:
+            raise HTTPException(status_code=503, detail="Aucun run PIAF chargé pour l'instant.")
+        response.headers["Cache-Control"] = "public, max-age=60"
+        frames = [
+            RainNowcastFrameInfo(
+                epoch=int(run.step_time(idx).timestamp()),
+                time_utc=run.step_time(idx),
+                lead_minutes=(idx + 1) * (PIAF_STEP_SECONDS // 60),
+            )
+            for idx in range(len(run.steps))
+        ]
+        return RainNowcastFramesResponse(
+            source_model=PIAF_SOURCE_MODEL,
+            run_utc=run.run.astimezone(UTC),
+            bounds=list(grid_bounds(run.steps[0])),
+            min_zoom=MIN_ZOOM,
+            max_zoom=MAX_ZOOM,
+            step_seconds=PIAF_STEP_SECONDS,
+            tile_path="/v1/rain-nowcast/tiles/{epoch}/{z}/{x}/{y}.png",
+            legend=[RadarLegendClass(**entry) for entry in legend()],
+            frames=frames,
+            attribution=PIAF_ATTRIBUTION,
+        )
+
+    @app.get("/v1/rain-nowcast/tiles/{epoch}/{z}/{x}/{y}.png", tags=["Météo"], response_class=Response)
+    async def get_rain_nowcast_tile(request: Request, epoch: int, z: int, x: int, y: int) -> Response:
+        """Une tuile PNG (256 px, Web Mercator, zooms 3 à 10) d'une échéance du run PIAF en mémoire."""
+        now_collector: MeteoFranceNowcastCollector = request.app.state.now_collector
+        run = now_collector.current_run()
+        if run is None:
+            raise HTTPException(status_code=503, detail="Aucun run PIAF chargé pour l'instant.")
+        if not (MIN_ZOOM <= z <= MAX_ZOOM) or not (0 <= x < 2**z) or not (0 <= y < 2**z):
+            raise HTTPException(status_code=404, detail="Tuile hors de la carte.")
+        grid = run.step_for_epoch(epoch)
+        if grid is None:
+            raise HTTPException(status_code=404, detail="Échéance PIAF inconnue dans le run courant.")
+        png = await run_in_threadpool(piaf_tile_png, grid, z, x, y)
+        return Response(
+            content=png,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=3600, immutable"},
+        )
 
     @app.get("/v1/shortterm", response_model=ShortTermResponse, tags=["Météo"])
     async def get_shortterm(
