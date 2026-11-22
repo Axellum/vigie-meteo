@@ -158,6 +158,77 @@ class MeteoFranceNowcastCollector(_MeteoFranceAuthCollector):
             return None
         return self._run
 
+    async def ensure_run(
+        self,
+        now: datetime | None = None,
+        *,
+        required_epoch: int | None = None,
+    ) -> PiafRun | None:
+        """Retourne un run PIAF prêt à servir les frames/tuiles, en le chargeant à la demande si nécessaire.
+
+        - Sans run en mémoire : charge le dernier run publié (si la clé API est configurée et le circuit fermé).
+        - Avec un run périmé (`age >= piaf_ttl_seconds`) : rafraîchit en tâche de fond sous
+          `piaf_grid_max_stale_seconds`, ou de façon bloquante au-delà (comme `_current_run`).
+        - Avec `required_epoch` aligné sur 5 min et postérieur à la dernière échéance du run en mémoire
+          (second worker uvicorn en retard sur le premier) : attend le chargement d'un run plus récent via `_load`
+          (verrouillé, donc coalescé entre requêtes de tuiles concurrentes).
+
+        Ne lève jamais : retourne le run en mémoire encore utilisable, ou None en cas d'indisponibilité.
+        """
+        ref_now = now or datetime.now(tz=UTC)
+        current = self.current_run()
+        age = (time.time() - current.loaded_at) if current is not None else None
+
+        needs_newer_epoch = False
+        if (
+            current is not None
+            and required_epoch is not None
+            and required_epoch % PIAF_STEP_SECONDS == 0
+            and current.step_for_epoch(required_epoch) is None
+        ):
+            last_epoch = int(current.step_time(len(current.steps) - 1).timestamp())
+            max_plausible = int(
+                (ref_now + timedelta(seconds=self._settings.piaf_steps * PIAF_STEP_SECONDS)).timestamp()
+            )
+            if last_epoch < required_epoch <= max_plausible:
+                needs_newer_epoch = True
+
+        # Cas rapide : un run frais est déjà en mémoire et couvre la demande.
+        if current is not None and age is not None and age < self._settings.piaf_ttl_seconds and not needs_newer_epoch:
+            return current
+
+        fallback = (
+            current
+            if current is not None and age is not None and age < self._settings.piaf_grid_max_stale_seconds
+            else None
+        )
+
+        headers = self._auth_headers()
+        if headers is None or self._cache.is_circuit_open(self.provider_name):
+            return fallback
+
+        try:
+            if needs_newer_epoch:
+                loaded = await self._load(headers, ref_now, seen=current)
+            else:
+                loaded = await self._current_run(headers, ref_now)
+        except (httpx.HTTPError, ValueError) as exc:
+            err_msg = redact_secret(str(exc), self._settings)
+            self._cache.record_failure(
+                self.provider_name,
+                err_msg,
+                self._settings.circuit_fail_threshold,
+                self._settings.circuit_cooldown_seconds,
+            )
+            log.warning("chargement PIAF à la demande en échec : %s", err_msg)
+            return fallback
+
+        if not loaded.steps:
+            return fallback
+        if loaded is not current:
+            self._cache.record_success(self.provider_name)
+        return loaded
+
     async def get_rain_nowcast(
         self,
         lat: float,

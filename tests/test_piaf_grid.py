@@ -175,3 +175,81 @@ async def test_a_map_too_old_is_not_served_when_the_source_fails(tmp_path: Path)
     )  # point jamais servi : pas de cache
     assert block.slices == [] and status.status == "unavailable"
     assert status.last_error is not None and "502" in status.last_error
+
+
+# ------------------------------------------------------------------------------------------------ ensure_run à la demande
+
+
+async def test_ensure_run_coalesces_concurrent_cold_start_loads(tmp_path: Path) -> None:
+    wcs = FakeWcs()
+    collector = make_collector(tmp_path, wcs)
+    runs = await asyncio.gather(*(collector.ensure_run(now=NOW) for _ in range(12)))
+    assert all(r is not None and r.run.strftime("%H:%M") == "20:50" for r in runs)
+    assert len({id(r) for r in runs}) == 1
+    assert len(wcs.requests) == 6  # 1 seul chargement (6 échéances) malgré 12 appels concurrents
+
+
+async def test_ensure_run_coalesces_concurrent_newer_epoch_refresh(tmp_path: Path) -> None:
+    wcs = FakeWcs()
+    collector = make_collector(tmp_path, wcs)
+    wcs.published = {"2026-11-17T20.50.00Z"}
+    first = await collector.ensure_run(now=NOW)
+    assert first is not None and first.run.strftime("%H:%M") == "20:50"
+    assert len(wcs.requests) == 6
+
+    # Le run 20 h 55 est publié ; le worker 2 a encore 20 h 50 tout frais (< TTL) et reçoit 10 tuiles pour +30 min de 20 h 55.
+    wcs.published = {"2026-11-17T20.55.00Z"}
+    later = NOW.replace(minute=8)
+    newer_epoch = int(first.step_time(len(first.steps) - 1).timestamp()) + 300
+    assert first.step_for_epoch(newer_epoch) is None
+
+    runs = await asyncio.gather(*(collector.ensure_run(now=later, required_epoch=newer_epoch) for _ in range(10)))
+    assert all(r is not None and r.run.strftime("%H:%M") == "20:55" for r in runs)
+    assert all(r is not None and r.step_for_epoch(newer_epoch) is not None for r in runs)
+    assert len(wcs.requests) == 6 + 6  # un seul rafraîchissement coalescé par le verrou
+
+
+async def test_ensure_run_triggers_background_refresh_when_stale_and_blocks_when_expired(tmp_path: Path) -> None:
+    wcs = FakeWcs()
+    collector = make_collector(tmp_path, wcs)
+    wcs.published = {"2026-11-17T20.50.00Z"}
+    first = await collector.ensure_run(now=NOW)
+    assert first is not None
+
+    # Périmé mais < max_stale : sert tout de suite l'ancien run et rafraîchit en tâche de fond.
+    first.loaded_at = time.time() - 360
+    wcs.published = {"2026-11-17T20.55.00Z"}
+    later = NOW.replace(minute=8)
+    served = await collector.ensure_run(now=later)
+    assert served is first
+    assert collector._refresh is not None
+    await collector._refresh
+    assert collector._run is not None and collector._run.run.strftime("%H:%M") == "20:55"
+
+    # Trop vieux (>= max_stale) et amont en panne : renvoie None sans lever d'exception.
+    collector._run.loaded_at = time.time() - 3600
+    wcs.fail = True
+    assert await collector.ensure_run(now=NOW.replace(hour=22)) is None
+
+
+async def test_ensure_run_returns_none_gracefully_on_missing_key_open_circuit_or_error(tmp_path: Path) -> None:
+    # Clé absente
+    wcs = FakeWcs()
+    no_key_cfg = Settings(METEO_DB_PATH=str(tmp_path / "nokey.db"), METEOFRANCE_API_KEY=None)
+    no_key_collector = MeteoFranceNowcastCollector(
+        httpx.AsyncClient(transport=httpx.MockTransport(wcs)),
+        CacheStore(no_key_cfg.db_path),
+        no_key_cfg,
+    )
+    assert await no_key_collector.ensure_run(now=NOW) is None
+    assert wcs.requests == []
+
+    # Erreur amont -> enregistre l'échec puis ouvre le circuit
+    wcs_err = FakeWcs()
+    wcs_err.fail = True
+    collector = make_collector(tmp_path / "err", wcs_err, METEO_CIRCUIT_FAIL_THRESHOLD=1)
+    assert await collector.ensure_run(now=NOW) is None
+    assert collector._cache.is_circuit_open(collector.provider_name)
+    before = len(wcs_err.requests)
+    assert await collector.ensure_run(now=NOW) is None
+    assert len(wcs_err.requests) == before  # circuit ouvert : aucune requête supplémentaire

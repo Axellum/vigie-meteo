@@ -380,9 +380,9 @@ def create_app(
 
     @app.get("/v1/rain-nowcast/frames", response_model=RainNowcastFramesResponse, tags=["Météo"])
     async def get_rain_nowcast_frames(request: Request, response: Response) -> RainNowcastFramesResponse:
-        """Les échéances (+5 à +60 min) du run PIAF déjà en mémoire, pour afficher la pluie prévue en tuiles PNG."""
+        """Les échéances (+5 à +60 min) du dernier run PIAF (chargé à la demande si besoin), pour afficher la pluie prévue en tuiles PNG."""
         now_collector: MeteoFranceNowcastCollector = request.app.state.now_collector
-        run = now_collector.current_run()
+        run = await now_collector.ensure_run()
         if run is None:
             raise HTTPException(status_code=503, detail="Aucun run PIAF chargé pour l'instant.")
         response.headers["Cache-Control"] = "public, max-age=60"
@@ -409,13 +409,13 @@ def create_app(
 
     @app.get("/v1/rain-nowcast/tiles/{epoch}/{z}/{x}/{y}.png", tags=["Météo"], response_class=Response)
     async def get_rain_nowcast_tile(request: Request, epoch: int, z: int, x: int, y: int) -> Response:
-        """Une tuile PNG (256 px, Web Mercator, zooms 3 à 10) d'une échéance du run PIAF en mémoire."""
-        now_collector: MeteoFranceNowcastCollector = request.app.state.now_collector
-        run = now_collector.current_run()
-        if run is None:
-            raise HTTPException(status_code=503, detail="Aucun run PIAF chargé pour l'instant.")
+        """Une tuile PNG (256 px, Web Mercator, zooms 3 à 10) d'une échéance du dernier run PIAF (chargé à la demande si besoin)."""
         if not (MIN_ZOOM <= z <= MAX_ZOOM) or not (0 <= x < 2**z) or not (0 <= y < 2**z):
             raise HTTPException(status_code=404, detail="Tuile hors de la carte.")
+        now_collector: MeteoFranceNowcastCollector = request.app.state.now_collector
+        run = await now_collector.ensure_run(required_epoch=epoch)
+        if run is None:
+            raise HTTPException(status_code=503, detail="Aucun run PIAF chargé pour l'instant.")
         grid = run.step_for_epoch(epoch)
         if grid is None:
             raise HTTPException(status_code=404, detail="Échéance PIAF inconnue dans le run courant.")

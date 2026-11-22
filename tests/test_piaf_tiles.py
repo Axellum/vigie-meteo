@@ -18,12 +18,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.collectors.grib2 import LatLonGrid
-from app.collectors.meteofrance import PIAF_STEP_SECONDS, PiafRun
+from app.collectors.meteofrance import PIAF_STEP_SECONDS, PiafRun, piaf_coverage_id, piaf_run_candidates
 from app.config import Settings
 from app.main import create_app
 from app.piaf_grid import classify_mm_5min, grid_bounds, piaf_tile_png
 from app.radar_grid import PALETTE, TILE, TRANSPARENT_TILE, legend
-from tests.piaf_grib import PIAF_NI, PIAF_NJ
+from tests.piaf_grib import PIAF_NI, PIAF_NJ, piaf_filled
 
 RUN_TIME = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
 PARIS = (48.8566, 2.3522)
@@ -154,17 +154,51 @@ def test_piaf_tile_rejects_out_of_range_zoom_and_coords() -> None:
 # ------------------------------------------------------------------------------------------------ routes FastAPI
 
 
-def api_client(tmp_path: Path, calls: list[httpx.Request]) -> TestClient:
-    def fail_on_network(request: httpx.Request) -> httpx.Response:
+def api_client(
+    tmp_path: Path,
+    calls: list[httpx.Request],
+    *,
+    handler=None,
+    api_key: str | None = "secret-mf-token-123",
+    **extra_settings: object,
+) -> TestClient:
+    def default_fail(request: httpx.Request) -> httpx.Response:
         calls.append(request)
         return httpx.Response(500)
 
-    settings = Settings(METEO_DB_PATH=str(tmp_path / "api.db"), METEOFRANCE_API_KEY="secret-mf-token-123")
-    client = httpx.AsyncClient(transport=httpx.MockTransport(fail_on_network))
+    def dispatch(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return handler(request)
+
+    settings = Settings(
+        METEO_DB_PATH=str(tmp_path / "api.db"),
+        METEOFRANCE_API_KEY=api_key,
+        **extra_settings,
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(dispatch if handler is not None else default_fail))
     return TestClient(create_app(settings=settings, http_client=client))
 
 
-def test_rain_nowcast_routes_return_503_when_no_piaf_run_loaded(tmp_path: Path) -> None:
+def make_wcs_handler(
+    published: set[str] | None = None,
+    *,
+    rain_step_seconds: int = 600,
+    rain_mm_5min: float = 0.4,
+):
+    """Gestionnaire WCS PIAF en mémoire : sec partout sauf `rain_step_seconds` à `rain_mm_5min`."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        coverage = request.url.params["coverageid"]
+        if published is not None and coverage not in published:
+            return httpx.Response(404, text="<mw:fault/>")
+        step = int(next(s for s in request.url.params.get_list("subset") if s.startswith("time("))[5:-1])
+        value = rain_mm_5min if step == rain_step_seconds else 0.0
+        return httpx.Response(200, content=piaf_filled(value))
+
+    return handle
+
+
+def test_rain_nowcast_routes_return_503_when_upstream_fails(tmp_path: Path) -> None:
     calls: list[httpx.Request] = []
     with api_client(tmp_path, calls) as client:
         r_frames = client.get("/v1/rain-nowcast/frames")
@@ -177,7 +211,93 @@ def test_rain_nowcast_routes_return_503_when_no_piaf_run_loaded(tmp_path: Path) 
         assert r_tile.status_code == 503
         assert r_tile.headers["content-type"].startswith("application/problem+json")
 
-    assert calls == []  # aucune requête Météo-France déclenchée
+    assert len(calls) >= 2  # chargement à la demande tenté et mis en échec proprement
+
+
+def test_rain_nowcast_routes_return_503_without_api_key_or_when_circuit_open(tmp_path: Path) -> None:
+    # Sans clé API : 503 immédiat, 0 requête réseau.
+    calls_no_key: list[httpx.Request] = []
+    tx, ty, _, _ = place_in_tile(*PARIS, 8)
+    epoch = int((RUN_TIME + timedelta(minutes=5)).timestamp())
+    with api_client(tmp_path / "nokey", calls_no_key, api_key=None) as client:
+        assert client.get("/v1/rain-nowcast/frames").status_code == 503
+        assert client.get(f"/v1/rain-nowcast/tiles/{epoch}/8/{tx}/{ty}.png").status_code == 503
+    assert calls_no_key == []
+
+    # Circuit breaker ouvert : 503 immédiat, 0 requête réseau.
+    calls_open: list[httpx.Request] = []
+    with api_client(tmp_path / "open", calls_open, METEO_CIRCUIT_FAIL_THRESHOLD=1) as client:
+        client.app.state.cache.record_failure("meteofrance-nowcast", "502", fail_threshold=1, cooldown_seconds=300)
+        assert client.get("/v1/rain-nowcast/frames").status_code == 503
+        assert client.get(f"/v1/rain-nowcast/tiles/{epoch}/8/{tx}/{ty}.png").status_code == 503
+    assert calls_open == []
+
+
+def test_rain_nowcast_frames_loads_piaf_on_cold_start(tmp_path: Path) -> None:
+    calls: list[httpx.Request] = []
+    latest_run = piaf_run_candidates(datetime.now(UTC), publish_delay_minutes=10)[0]
+    wcs = make_wcs_handler(published={piaf_coverage_id(latest_run)}, rain_step_seconds=600, rain_mm_5min=0.4)
+
+    with api_client(tmp_path, calls, handler=wcs, METEO_PIAF_STEPS=4) as client:
+        assert client.app.state.now_collector.current_run() is None
+
+        r_frames = client.get("/v1/rain-nowcast/frames")
+        assert r_frames.status_code == 200
+        body = r_frames.json()
+        assert body["source_model"] == "meteofrance-piaf"
+        assert body["run_utc"] == latest_run.strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert len(body["frames"]) == 4
+        assert len(calls) == 4  # 4 échéances chargées une fois
+
+        # Appels suivants servis depuis la mémoire sans requête réseau.
+        assert client.get("/v1/rain-nowcast/frames").status_code == 200
+        wet_epoch = body["frames"][1]["epoch"]
+        tx, ty, px, py = place_in_tile(*PARIS, 8)
+        r_tile = client.get(f"/v1/rain-nowcast/tiles/{wet_epoch}/8/{tx}/{ty}.png")
+        assert r_tile.status_code == 200
+        assert read_png(r_tile.content)[py, px] == 5
+        assert len(calls) == 4
+
+
+def test_rain_nowcast_tile_loads_piaf_on_cold_start(tmp_path: Path) -> None:
+    calls: list[httpx.Request] = []
+    latest_run = piaf_run_candidates(datetime.now(UTC), publish_delay_minutes=10)[0]
+    wcs = make_wcs_handler(published={piaf_coverage_id(latest_run)}, rain_step_seconds=600, rain_mm_5min=0.4)
+
+    with api_client(tmp_path, calls, handler=wcs, METEO_PIAF_STEPS=4) as client:
+        assert client.app.state.now_collector.current_run() is None
+        wet_epoch = int((latest_run + timedelta(minutes=10)).timestamp())
+        tx, ty, px, py = place_in_tile(*PARIS, 8)
+
+        r_tile = client.get(f"/v1/rain-nowcast/tiles/{wet_epoch}/8/{tx}/{ty}.png")
+        assert r_tile.status_code == 200
+        assert r_tile.headers["content-type"] == "image/png"
+        assert read_png(r_tile.content)[py, px] == 5
+        assert len(calls) == 4
+
+
+def test_rain_nowcast_tile_refreshes_when_newer_epoch_requested(tmp_path: Path) -> None:
+    """Simule un 2e worker uvicorn qui détient encore le run précédent quand le 1er a publié un run plus récent."""
+    calls: list[httpx.Request] = []
+    latest_run, older_run = piaf_run_candidates(datetime.now(UTC), publish_delay_minutes=10)[:2]
+    # La nouvelle échéance (+20 min du nouveau run = step 4, soit 1200 s) contient de la pluie sur Paris.
+    wcs = make_wcs_handler(published={piaf_coverage_id(latest_run)}, rain_step_seconds=1200, rain_mm_5min=0.4)
+
+    with api_client(tmp_path, calls, handler=wcs, METEO_PIAF_STEPS=4) as client:
+        # Le worker 2 vient tout juste de charger `older_run` (age < TTL : frais, mais en retard d'un run).
+        dry = make_piaf_grid(rain_at=None)
+        client.app.state.now_collector._run = PiafRun(run=older_run, steps=[dry] * 4)
+
+        newest_epoch = int((latest_run + timedelta(minutes=20)).timestamp())
+        assert client.app.state.now_collector._run.step_for_epoch(newest_epoch) is None
+
+        tx, ty, px, py = place_in_tile(*PARIS, 8)
+        r_tile = client.get(f"/v1/rain-nowcast/tiles/{newest_epoch}/8/{tx}/{ty}.png")
+        assert r_tile.status_code == 200
+        assert r_tile.headers["content-type"] == "image/png"
+        assert read_png(r_tile.content)[py, px] == 5
+        assert client.app.state.now_collector._run.run == latest_run
+        assert len(calls) == 4
 
 
 def test_rain_nowcast_frames_and_tiles_routes(tmp_path: Path) -> None:
@@ -228,15 +348,20 @@ def test_rain_nowcast_frames_and_tiles_routes(tmp_path: Path) -> None:
         assert r_out.status_code == 200
         assert r_out.content == TRANSPARENT_TILE
 
-        # 404 sur epoch absent du run courant
+        # 404 sur epoch absent du run courant (passé, non aligné, ou trop loin dans le futur) -> 0 appel réseau
         assert client.get(f"/v1/rain-nowcast/tiles/{int(RUN_TIME.timestamp())}/8/{tx}/{ty}.png").status_code == 404
         assert client.get(f"/v1/rain-nowcast/tiles/{wet_epoch + 1}/8/{tx}/{ty}.png").status_code == 404
-        assert client.get(f"/v1/rain-nowcast/tiles/{wet_epoch + 7200}/8/{tx}/{ty}.png").status_code == 404
+        far_future = int(datetime.now(UTC).timestamp()) + 86400
+        far_future -= far_future % PIAF_STEP_SECONDS
+        assert client.get(f"/v1/rain-nowcast/tiles/{far_future}/8/{tx}/{ty}.png").status_code == 404
 
-        # 404 sur zoom hors [3, 10] ou coordonnées x/y hors limites
+        # 404 sur zoom hors [3, 10] ou coordonnées x/y hors limites -> 0 appel réseau
         assert client.get(f"/v1/rain-nowcast/tiles/{wet_epoch}/2/1/1.png").status_code == 404
         assert client.get(f"/v1/rain-nowcast/tiles/{wet_epoch}/11/0/0.png").status_code == 404
         assert client.get(f"/v1/rain-nowcast/tiles/{wet_epoch}/8/256/0.png").status_code == 404
         assert client.get(f"/v1/rain-nowcast/tiles/{wet_epoch}/8/0/-1.png").status_code == 404
 
-    assert calls == []  # toujours 0 appel réseau vers Météo-France
+        assert calls == []  # 0 appel réseau tant qu'on ne réclame pas d'échéance plus récente plausible
+
+        # Échéance alignée postérieure au run chargé : tente un rafraîchissement, échoue en amont -> repli 404 propre
+        assert client.get(f"/v1/rain-nowcast/tiles/{wet_epoch + 7200}/8/{tx}/{ty}.png").status_code == 404
