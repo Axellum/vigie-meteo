@@ -35,6 +35,10 @@ C'est la source météo interne de [Vigie](https://github.com/Axellum/vigie-api)
 | `GET /v1/radar/{area}/tiles/{epoch}/{z}/{x}/{y}.png` | La même chose pour une zone d'outre-mer (ou `france`) |
 | `GET /v1/health` | État de la base SQLite et des circuits breakers |
 
+### Cache SQLite : appels partagés
+
+Les prévisions Open-Meteo passent par un cache SQLite (`app/cache.py`, durée de vie `METEO_FORECAST_TTL_SECONDS`, entrées périmées servies en panne jusqu'à `METEO_MAX_STALE_SECONDS`, 24 h par défaut). Quand plusieurs requêtes arrivent en même temps sur une clé froide ou périmée, **un seul appel part vers la source** (par clé et adresse) : les autres attendent sa réponse, et une panne n'est comptée qu'une fois par le disjoncteur.
+
 ### Radar (lame d'eau)
 
 `DPRadar/v1` (mosaïques `METROPOLE`, `ANTILLES`, `REUNION` et `NOUVELLE-CALEDONIE`, observation `LAME_D_EAU`, maille 500 m, HDF5) ne rend que la dernière image de chaque zone : une tâche de fond la lit
