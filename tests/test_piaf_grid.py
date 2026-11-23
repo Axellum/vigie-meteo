@@ -7,6 +7,7 @@ aux réponses point par point du WCS sur 6 nœuds où il pleuvait. Ces tests en 
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -106,6 +107,15 @@ def make_collector(tmp_path: Path, wcs: FakeWcs, **settings: object) -> MeteoFra
     return MeteoFranceNowcastCollector(client, CacheStore(cfg.db_path), cfg)
 
 
+def age_run(collector: MeteoFranceNowcastCollector, seconds: float) -> None:
+    """Fait vieillir le run de `seconds` : en mémoire et sur disque (l'autre processus le voit vieillir aussi)."""
+    assert collector._run is not None and collector._store is not None
+    stamp = time.time() - seconds
+    collector._run.loaded_at = stamp
+    for stored in collector._store.directory.glob("*.npz"):
+        os.utime(stored, (stamp, stamp))
+
+
 async def test_many_points_cost_one_map_per_run(tmp_path: Path) -> None:
     wcs = FakeWcs()
     collector = make_collector(tmp_path, wcs)
@@ -138,7 +148,7 @@ async def test_an_old_map_is_served_while_the_next_run_downloads(tmp_path: Path)
     assert collector._run is not None and collector._run.run.strftime("%H:%M") == "20:50"
 
     # 6 minutes plus tard : la carte a passé son délai (5 min) ; le run de 20 h 55 est publié, avec plus de pluie.
-    collector._run.loaded_at = time.time() - 360
+    age_run(collector, 360)
     wcs.published = {"2026-11-17T20.55.00Z"}
     wcs.rain = 0.6
     later = NOW.replace(minute=8)
@@ -156,7 +166,7 @@ async def test_no_newer_run_means_no_download(tmp_path: Path) -> None:
     collector = make_collector(tmp_path, wcs)
     wcs.published = {"2026-11-17T20.50.00Z"}
     await collector.get_rain_nowcast(48.85, 2.35, now=NOW)
-    collector._run.loaded_at = time.time() - 360
+    age_run(collector, 360)
     await collector.get_rain_nowcast(45.76, 4.84, now=NOW)
     await collector._refresh
     assert len(wcs.requests) == 6  # 20 h 50 est encore le dernier run : rien de retéléchargé
@@ -167,7 +177,7 @@ async def test_a_map_too_old_is_not_served_when_the_source_fails(tmp_path: Path)
     wcs = FakeWcs()
     collector = make_collector(tmp_path, wcs)
     await collector.get_rain_nowcast(48.85, 2.35, now=NOW)
-    collector._run.loaded_at = time.time() - 3600  # au-delà de 15 min
+    age_run(collector, 3600)  # au-delà de 15 min
     wcs.fail = True
     an_hour_later = NOW.replace(hour=22)  # des runs plus récents existent, et le WCS est en panne
     block, status = await collector.get_rain_nowcast(
@@ -217,7 +227,7 @@ async def test_ensure_run_triggers_background_refresh_when_stale_and_blocks_when
     assert first is not None
 
     # Périmé mais < max_stale : sert tout de suite l'ancien run et rafraîchit en tâche de fond.
-    first.loaded_at = time.time() - 360
+    age_run(collector, 360)
     wcs.published = {"2026-11-17T20.55.00Z"}
     later = NOW.replace(minute=8)
     served = await collector.ensure_run(now=later)
@@ -227,7 +237,7 @@ async def test_ensure_run_triggers_background_refresh_when_stale_and_blocks_when
     assert collector._run is not None and collector._run.run.strftime("%H:%M") == "20:55"
 
     # Trop vieux (>= max_stale) et amont en panne : renvoie None sans lever d'exception.
-    collector._run.loaded_at = time.time() - 3600
+    age_run(collector, 3600)
     wcs.fail = True
     assert await collector.ensure_run(now=NOW.replace(hour=22)) is None
 

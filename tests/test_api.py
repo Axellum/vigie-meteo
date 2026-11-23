@@ -161,6 +161,8 @@ def test_stale_while_revalidate_and_circuit_breaker_on_502(tmp_path: Path) -> No
         piaf_run = client.app.state.now_collector._run
         piaf_run.loaded_at = time.time() - 3600
         piaf_run.run -= timedelta(hours=1)
+        for stored in client.app.state.now_collector._store.directory.glob("*.npz"):
+            stored.unlink()  # la copie sur disque (partagée avec l'autre processus) a vieilli avec celle de la mémoire
 
         r2 = client.get("/v1/rain-nowcast", params={"lat": 48.85, "lon": 2.35})
         assert r2.status_code == 200
