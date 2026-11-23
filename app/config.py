@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     # La carte PIAF d'un run (toute la France) reste servie, pendant qu'un run plus récent se télécharge en tâche de
     # fond, tant qu'elle a moins de cet âge ; au-delà, la requête attend le téléchargement (ou bascule en repli).
     piaf_grid_max_stale_seconds: int = Field(default=900, ge=60, alias="METEO_PIAF_GRID_MAX_STALE_SECONDS")
+    # Le run PIAF rangé sur disque pour que les deux processus n'en téléchargent qu'un (défaut : `piaf/` à côté de la base SQLite).
+    piaf_dir: str | None = Field(default=None, alias="METEO_PIAF_DIR")
+    piaf_keep_runs: int = Field(default=2, ge=1, le=12, alias="METEO_PIAF_KEEP_RUNS")
 
     # Mosaïque radar « lame d'eau » (DPRadar, métropole) : images gardées sur disque pour l'animation et les tuiles.
     radar_enabled: bool = Field(default=True, alias="METEO_RADAR_ENABLED")

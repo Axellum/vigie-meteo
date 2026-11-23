@@ -18,6 +18,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -31,6 +32,7 @@ from app.models import (
     RainNowcastSlice,
     SourceStatus,
 )
+from app.piaf_store import PiafStore, epoch_of
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +153,15 @@ class MeteoFranceNowcastCollector(_MeteoFranceAuthCollector):
         self._run: PiafRun | None = None
         self._lock = asyncio.Lock()
         self._refresh: asyncio.Task[None] | None = None
+        # Le run rangé sur disque : les deux processus de la passerelle n'en téléchargent qu'un (voir `app/piaf_store.py`).
+        self._store = self._open_store(settings)
+
+    @staticmethod
+    def _open_store(settings: Settings) -> PiafStore | None:
+        if settings.db_path == ":memory:":
+            return None
+        directory = Path(settings.piaf_dir) if settings.piaf_dir else Path(settings.db_path).resolve().parent / "piaf"
+        return PiafStore(directory, keep_runs=settings.piaf_keep_runs)
 
     def current_run(self) -> PiafRun | None:
         """Le run PIAF actuellement en mémoire (sans requête réseau), ou None s'il n'est pas encore chargé."""
@@ -325,30 +336,77 @@ class MeteoFranceNowcastCollector(_MeteoFranceAuthCollector):
             log.warning("rafraîchissement PIAF en échec : %s", redact_secret(str(exc), self._settings))
 
     async def _load(self, headers: dict[str, str], now: datetime, seen: PiafRun | None) -> PiafRun:
-        """Télécharge le dernier run publié (une requête par échéance), une seule fois à la fois."""
+        """Le dernier run publié : relu sur disque si l'autre processus l'a déjà téléchargé, sinon téléchargé (une requête
+        par échéance), une seule fois à la fois dans ce processus et entre les deux processus."""
         async with self._lock:
             if self._run is not seen and self._run is not None:
                 return self._run  # chargé par une autre requête pendant l'attente du verrou
-            run, first = await self._first_step(headers, now)
-            if self._run is not None and self._run.run == run:
-                self._run.loaded_at = time.time()  # pas de run plus récent publié : on regardera au prochain délai
-                return self._run
-            sem = asyncio.Semaphore(self._settings.piaf_concurrency)
+            if self._store is None:
+                return await self._download_latest(headers, now)
+            async with self._store.exclusive():
+                shared = await self._adopt_from_disk(seen)
+                if shared is not None and time.time() - shared.loaded_at < self._settings.piaf_ttl_seconds:
+                    return shared  # téléchargé ou vérifié il y a moins d'un délai par l'autre processus : rien à redemander
+                before = self._run
+                run = await self._download_latest(headers, now)
+                try:
+                    if run is not before:
+                        checked = await asyncio.to_thread(self._store.save, run.run, run.steps)
+                        await asyncio.to_thread(self._store.purge)
+                    else:
+                        checked = self._store.touch(epoch_of(run.run))  # toujours le plus récent publié : l'autre processus le saura
+                    if checked is not None:
+                        run.loaded_at = checked  # notre propre écriture n'est pas une vérification de l'autre processus
+                except OSError as exc:  # disque plein ou illisible : ce processus sert son run, l'autre téléchargera le sien
+                    log.warning("PIAF : run non rangé sur disque : %s", exc)
+                return run
 
-            async def step(seconds: int) -> LatLonGrid:
-                async with sem:
-                    resp = await self._get_step(run, seconds, headers)
-                    resp.raise_for_status()
-                    return decode_latlon_simple(resp.content)
+    async def _adopt_from_disk(self, seen: PiafRun | None) -> PiafRun | None:
+        """Le run du disque s'il est plus récent que celui de ce processus, ou si l'autre processus l'a vérifié depuis.
 
-            seconds = [PIAF_STEP_SECONDS * i for i in range(2, self._settings.piaf_steps + 1)]
-            rest = await asyncio.gather(*(step(s) for s in seconds))
-            grids = [first, *rest]
-            shape = first.values.shape
-            if any(g.values.shape != shape or g.lat0 != first.lat0 or g.lon0 != first.lon0 for g in grids):
-                raise ValueError(f"cartes PIAF de géométries différentes dans le run {piaf_coverage_id(run)}")
-            self._run = PiafRun(run=run, steps=grids)
+        Ne touche pas au réseau. Un run plus vieux que le délai est quand même repris comme point de départ : la
+        recherche d'un run plus récent saute alors les candidats qu'il couvre déjà.
+        """
+        assert self._store is not None
+        newest = await asyncio.to_thread(self._store.newest)
+        if newest is None:
+            return None
+        epoch, checked = newest
+        if seen is not None and epoch < epoch_of(seen.run):
+            return None
+        if seen is not None and epoch == epoch_of(seen.run):
+            if checked > seen.loaded_at:
+                seen.loaded_at = checked
+                return seen
+            return None
+        loaded = await asyncio.to_thread(self._store.load, epoch, self._settings.piaf_steps)
+        if loaded is None:
+            return None
+        steps, checked = loaded
+        self._run = PiafRun(run=datetime.fromtimestamp(epoch, tz=UTC), steps=steps, loaded_at=checked)
+        return self._run
+
+    async def _download_latest(self, headers: dict[str, str], now: datetime) -> PiafRun:
+        run, first = await self._first_step(headers, now)
+        if self._run is not None and self._run.run == run:
+            self._run.loaded_at = time.time()  # pas de run plus récent publié : on regardera au prochain délai
             return self._run
+        sem = asyncio.Semaphore(self._settings.piaf_concurrency)
+
+        async def step(seconds: int) -> LatLonGrid:
+            async with sem:
+                resp = await self._get_step(run, seconds, headers)
+                resp.raise_for_status()
+                return decode_latlon_simple(resp.content)
+
+        seconds = [PIAF_STEP_SECONDS * i for i in range(2, self._settings.piaf_steps + 1)]
+        rest = await asyncio.gather(*(step(s) for s in seconds))
+        grids = [first, *rest]
+        shape = first.values.shape
+        if any(g.values.shape != shape or g.lat0 != first.lat0 or g.lon0 != first.lon0 for g in grids):
+            raise ValueError(f"cartes PIAF de géométries différentes dans le run {piaf_coverage_id(run)}")
+        self._run = PiafRun(run=run, steps=grids)
+        return self._run
 
     async def _first_step(self, headers: dict[str, str], now: datetime) -> tuple[datetime, LatLonGrid]:
         """Le dernier run publié et sa première échéance (sans le catalogue de 2 Mo)."""
