@@ -1,5 +1,7 @@
 """Classe de base pour les collecteurs résilients (Cache SQLite + Circuit Breaker)."""
 
+import asyncio
+import logging
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -10,10 +12,20 @@ from app.cache import CacheStore
 from app.config import Settings, redact_secret
 from app.models import FreshnessStatus, SourceStatus
 
+log = logging.getLogger(__name__)
+
+FetchResult = tuple[Any | None, SourceStatus]
+
 
 def snap_coord(value: float, step: float = 0.02) -> float:
     """Aligne une coordonnée sur une grille (~2 km) pour partager le cache entre requêtes proches."""
     return round(round(value / step) * step, 4)
+
+
+def _consume_exception(task: asyncio.Task[FetchResult]) -> None:
+    """Lit l'exception d'un appel dont plus personne n'attend la réponse (sinon asyncio la signale sans la relier à rien)."""
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        log.warning("appel amont en échec sans attente : %s", exc)
 
 
 class ResilientCollector:
@@ -25,6 +37,8 @@ class ResilientCollector:
         self._client = client
         self._cache = cache
         self._settings = settings
+        # Les appels amont en cours, par (clé de cache, adresse) : N requêtes simultanées sur une clé froide = un seul appel.
+        self._in_flight: dict[tuple[str, str], asyncio.Task[FetchResult]] = {}
 
     async def fetch_with_cache(
         self,
@@ -52,32 +66,56 @@ class ResilientCollector:
         if self._cache.is_circuit_open(self.provider_name):
             return self._fallback_from_cache(cached, now_ts)
 
-        req_headers = {"User-Agent": self._settings.user_agent}
-        if headers:
-            req_headers.update(headers)
+        # Une requête déjà partie pour cette clé : on attend sa réponse au lieu de refaire le même appel amont.
+        flight_key = (cache_key, url)
+        task = self._in_flight.get(flight_key)
+        if task is None:
+            task = asyncio.create_task(self._call_upstream(flight_key, cache_key, url, params, headers, cached, now_ts))
+            task.add_done_callback(_consume_exception)
+            self._in_flight[flight_key] = task
+        # `shield` : si le client qui a lancé l'appel part (annulation), les autres reçoivent quand même la réponse.
+        return await asyncio.shield(task)
 
+    async def _call_upstream(
+        self,
+        flight_key: tuple[str, str],
+        cache_key: str,
+        url: str,
+        params: dict[str, Any] | None,
+        headers: dict[str, str] | None,
+        cached: tuple[Any, float] | None,
+        now_ts: float,
+    ) -> FetchResult:
+        """L'appel amont d'une clé (partagé par toutes les requêtes simultanées), rangé en cache ou, en panne, le cache périmé."""
         try:
-            response = await self._client.get(
-                url,
-                params=params,
-                headers=req_headers,
-                timeout=self._settings.http_timeout_seconds,
-            )
-            response.raise_for_status()
-            data = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            err_msg = redact_secret(str(exc), self._settings)
-            self._cache.record_failure(
-                self.provider_name,
-                err_msg,
-                self._settings.circuit_fail_threshold,
-                self._settings.circuit_cooldown_seconds,
-            )
-            return self._fallback_from_cache(cached, now_ts, last_error=err_msg)
+            req_headers = {"User-Agent": self._settings.user_agent}
+            if headers:
+                req_headers.update(headers)
 
-        updated_ts = self._cache.set_cache(cache_key, self.provider_name, data)
-        self._cache.record_success(self.provider_name)
-        return data, self._build_status("fresh", updated_ts, 0)
+            try:
+                response = await self._client.get(
+                    url,
+                    params=params,
+                    headers=req_headers,
+                    timeout=self._settings.http_timeout_seconds,
+                )
+                response.raise_for_status()
+                data = response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                err_msg = redact_secret(str(exc), self._settings)
+                self._cache.record_failure(
+                    self.provider_name,
+                    err_msg,
+                    self._settings.circuit_fail_threshold,
+                    self._settings.circuit_cooldown_seconds,
+                )
+                return self._fallback_from_cache(cached, now_ts, last_error=err_msg)
+
+            updated_ts = self._cache.set_cache(cache_key, self.provider_name, data)
+            self._cache.record_success(self.provider_name)
+            return data, self._build_status("fresh", updated_ts, 0)
+        finally:
+            self._in_flight.pop(flight_key, None)
 
     def _fallback_from_cache(
         self,
