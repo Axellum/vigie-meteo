@@ -97,6 +97,19 @@ class CacheStore:
             self._conn.commit()
         return now_ts
 
+    def purge_older_than(self, max_age_seconds: float, keep_providers: tuple[str, ...] = ()) -> int:
+        """Supprime les entrées plus vieilles que `max_age_seconds` (hors `keep_providers`) et rend leur nombre.
+
+        Au-delà de `METEO_MAX_STALE_SECONDS` une entrée ne peut plus être servie, même en panne de la source : elle ne sert plus à rien.
+        """
+        cutoff = time.time() - max_age_seconds
+        marks = ",".join("?" for _ in keep_providers)
+        sql = "DELETE FROM cache_entries WHERE updated_at_ts < ?" + (f" AND provider NOT IN ({marks})" if marks else "")
+        with self._lock:
+            removed = self._conn.execute(sql, (cutoff, *keep_providers)).rowcount
+            self._conn.commit()
+        return removed
+
     def is_circuit_open(self, provider: str) -> bool:
         """Indique si le circuit breaker d'un fournisseur est actuellement ouvert."""
         now_ts = time.time()

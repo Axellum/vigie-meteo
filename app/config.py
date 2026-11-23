@@ -142,6 +142,8 @@ class Settings(BaseSettings):
     forecast_ttl_seconds: int = Field(default=900, alias="METEO_FORECAST_TTL_SECONDS")
     nowcast_ttl_seconds: int = Field(default=180, alias="METEO_NOWCAST_TTL_SECONDS")
     max_stale_seconds: int = Field(default=86400, alias="METEO_MAX_STALE_SECONDS")
+    # Purge des entrées du cache SQLite plus vieilles que `max_stale_seconds` (elles ne peuvent plus être servies) : toutes les 6 h.
+    cache_purge_interval_seconds: int = Field(default=21600, ge=60, alias="METEO_CACHE_PURGE_INTERVAL_SECONDS")
 
     # Circuit breaker (protection contre les 429 / 502 / timeouts amont)
     circuit_fail_threshold: int = Field(default=3, alias="METEO_CIRCUIT_FAIL_THRESHOLD")

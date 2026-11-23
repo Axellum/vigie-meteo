@@ -2,6 +2,8 @@
 
 import asyncio
 import contextlib
+import logging
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +26,7 @@ from app.collectors.aromepi import ATTRIBUTION as AROMEPI_ATTRIBUTION
 from app.collectors.aromepi import SOURCE_MODEL as AROMEPI_SOURCE_MODEL
 from app.collectors.aromepi import AromePiCollector, AromePiStore
 from app.collectors.dpclim import ATTRIBUTION as DPCLIM_ATTRIBUTION
+from app.collectors.dpclim import PROVIDER as DPCLIM_PROVIDER
 from app.collectors.dpclim import SOURCE_MODEL as DPCLIM_SOURCE_MODEL
 from app.collectors.dpclim import BusyError, StationDailyCollector, UpstreamError
 from app.collectors.ensemble import (
@@ -37,6 +40,7 @@ from app.collectors.ensemble import (
     ProbabilityStore,
 )
 from app.collectors.forests import ATTRIBUTION as FORESTS_ATTRIBUTION
+from app.collectors.forests import PROVIDER as FORESTS_PROVIDER
 from app.collectors.forests import SOURCE_MODEL as FORESTS_SOURCE_MODEL
 from app.collectors.forests import ForestsCollector
 from app.collectors.meteofrance import (
@@ -77,6 +81,25 @@ from app.piaf_grid import grid_bounds, piaf_tile_png
 from app.radar_grid import AREAS, MAX_ZOOM, METROPOLE, MIN_ZOOM, legend, tile_png
 from app.security import ApiKeyMiddleware
 from app.services.weather import WeatherAggregatorService
+
+log = logging.getLogger(__name__)
+
+
+async def purge_cache_forever(cache: CacheStore, cfg: Settings) -> None:
+    """Tâche de fond : vide du cache SQLite les entrées que plus rien ne peut servir (plus vieilles que la tolérance « périmé »).
+
+    Les relevés DPClim et la météo des forêts gardent leurs entrées : leur propre logique les renouvelle (une commande par station et par jour).
+    """
+    while True:
+        try:
+            removed = await asyncio.to_thread(
+                cache.purge_older_than, cfg.max_stale_seconds, (DPCLIM_PROVIDER, FORESTS_PROVIDER)
+            )
+            if removed:
+                log.info("cache SQLite : %d entrées trop vieilles supprimées", removed)
+        except sqlite3.Error as exc:  # une base occupée ou illisible : on réessaie au prochain tour
+            log.warning("purge du cache SQLite en échec : %s", exc)
+        await asyncio.sleep(cfg.cache_purge_interval_seconds)
 
 
 def create_app(
@@ -148,10 +171,12 @@ def create_app(
         app_instance.state.pearp = pearp
         pearp_task = asyncio.create_task(pearp.run_forever()) if pearp.enabled() and own_client else None
 
+        purge_task = asyncio.create_task(purge_cache_forever(cache, cfg)) if own_client else None
+
         try:
             yield
         finally:
-            for task in (pearome_task, pearp_task, aromeom_task, forests_task):
+            for task in (pearome_task, pearp_task, aromeom_task, forests_task, purge_task):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):

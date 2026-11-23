@@ -35,9 +35,9 @@ C'est la source météo interne de [Vigie](https://github.com/Axellum/vigie-api)
 | `GET /v1/radar/{area}/tiles/{epoch}/{z}/{x}/{y}.png` | La même chose pour une zone d'outre-mer (ou `france`) |
 | `GET /v1/health` | État de la base SQLite et des circuits breakers |
 
-### Cache SQLite : appels partagés
+### Cache SQLite : appels partagés et purge
 
-Les prévisions Open-Meteo passent par un cache SQLite (`app/cache.py`, durée de vie `METEO_FORECAST_TTL_SECONDS`, entrées périmées servies en panne jusqu'à `METEO_MAX_STALE_SECONDS`, 24 h par défaut). Quand plusieurs requêtes arrivent en même temps sur une clé froide ou périmée, **un seul appel part vers la source** (par clé et adresse) : les autres attendent sa réponse, et une panne n'est comptée qu'une fois par le disjoncteur.
+Les prévisions Open-Meteo passent par un cache SQLite (`app/cache.py`, durée de vie `METEO_FORECAST_TTL_SECONDS`, entrées périmées servies en panne jusqu'à `METEO_MAX_STALE_SECONDS`, 24 h par défaut). Quand plusieurs requêtes arrivent en même temps sur une clé froide ou périmée, **un seul appel part vers la source** (par clé et adresse) : les autres attendent sa réponse, et une panne n'est comptée qu'une fois par le disjoncteur. Une tâche de fond supprime toutes les 6 h (`METEO_CACHE_PURGE_INTERVAL_SECONDS`) les entrées plus vieilles que `METEO_MAX_STALE_SECONDS`, que plus rien ne peut servir ; les relevés DPClim et la météo des forêts, qui ont leur propre renouvellement, sont conservés.
 
 ### Radar (lame d'eau)
 
