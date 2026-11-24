@@ -426,29 +426,46 @@ def create_app(
             min_zoom=MIN_ZOOM,
             max_zoom=MAX_ZOOM,
             step_seconds=PIAF_STEP_SECONDS,
-            tile_path="/v1/rain-nowcast/tiles/{epoch}/{z}/{x}/{y}.png",
+            # Le run dans l'adresse : un nouveau run redessine les mêmes instants, une adresse sans run ne peut pas être immuable.
+            tile_path=f"/v1/rain-nowcast/tiles/{{epoch}}/{{z}}/{{x}}/{{y}}.png?run={int(run.run.timestamp())}",
             legend=[RadarLegendClass(**entry) for entry in legend()],
             frames=frames,
             attribution=PIAF_ATTRIBUTION,
         )
 
     @app.get("/v1/rain-nowcast/tiles/{epoch}/{z}/{x}/{y}.png", tags=["Météo"], response_class=Response)
-    async def get_rain_nowcast_tile(request: Request, epoch: int, z: int, x: int, y: int) -> Response:
-        """Une tuile PNG (256 px, Web Mercator, zooms 3 à 10) d'une échéance du dernier run PIAF (chargé à la demande si besoin)."""
+    async def get_rain_nowcast_tile(
+        request: Request,
+        epoch: int,
+        z: int,
+        x: int,
+        y: int,
+        run: int | None = Query(None, description="Run PIAF (epoch UTC) lu dans `tile_path` de `/v1/rain-nowcast/frames`."),
+    ) -> Response:
+        """Une tuile PNG (256 px, Web Mercator, zooms 3 à 10) d'une échéance du dernier run PIAF (chargé à la demande si besoin).
+
+        Un nouveau run toutes les 5 minutes redessine les mêmes instants : la tuile n'est « immutable » que si `run` est donné et
+        est le run qui l'a dessinée ; sinon elle est gardée 60 s (le run en mémoire peut être plus récent que celui du client, ou
+        plus ancien dans l'autre processus). Le run dessiné est dans l'en-tête `X-Piaf-Run`.
+        """
         if not (MIN_ZOOM <= z <= MAX_ZOOM) or not (0 <= x < 2**z) or not (0 <= y < 2**z):
             raise HTTPException(status_code=404, detail="Tuile hors de la carte.")
         now_collector: MeteoFranceNowcastCollector = request.app.state.now_collector
-        run = await now_collector.ensure_run(required_epoch=epoch)
-        if run is None:
+        piaf = await now_collector.ensure_run(required_epoch=epoch)
+        if piaf is None:
             raise HTTPException(status_code=503, detail="Aucun run PIAF chargé pour l'instant.")
-        grid = run.step_for_epoch(epoch)
+        grid = piaf.step_for_epoch(epoch)
         if grid is None:
             raise HTTPException(status_code=404, detail="Échéance PIAF inconnue dans le run courant.")
         png = await run_in_threadpool(piaf_tile_png, grid, z, x, y)
+        drawn = int(piaf.run.timestamp())
         return Response(
             content=png,
             media_type="image/png",
-            headers={"Cache-Control": "public, max-age=3600, immutable"},
+            headers={
+                "Cache-Control": "public, max-age=3600, immutable" if run == drawn else "public, max-age=60",
+                "X-Piaf-Run": str(drawn),
+            },
         )
 
     @app.get("/v1/shortterm", response_model=ShortTermResponse, tags=["Météo"])

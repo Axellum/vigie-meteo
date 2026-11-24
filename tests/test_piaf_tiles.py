@@ -318,7 +318,8 @@ def test_rain_nowcast_frames_and_tiles_routes(tmp_path: Path) -> None:
         assert body["bounds"] == [-6.0, 41.0, 10.5, 51.5]
         assert body["min_zoom"] == 3 and body["max_zoom"] == 10
         assert body["step_seconds"] == PIAF_STEP_SECONDS
-        assert body["tile_path"] == "/v1/rain-nowcast/tiles/{epoch}/{z}/{x}/{y}.png"
+        run_epoch = int(RUN_TIME.timestamp())
+        assert body["tile_path"] == f"/v1/rain-nowcast/tiles/{{epoch}}/{{z}}/{{x}}/{{y}}.png?run={run_epoch}"
         assert body["legend"] == legend()
         assert "Météo-France" in body["attribution"] and "PIAF" in body["attribution"]
         assert len(body["frames"]) == 12
@@ -331,12 +332,21 @@ def test_rain_nowcast_frames_and_tiles_routes(tmp_path: Path) -> None:
         wet_epoch = body["frames"][1]["epoch"]
         tx, ty, px, py = place_in_tile(*PARIS, 8)
 
-        # Tuile pluvieuse sur Paris (+10 min)
-        r_wet = client.get(f"/v1/rain-nowcast/tiles/{wet_epoch}/8/{tx}/{ty}.png")
+        # Tuile pluvieuse sur Paris (+10 min), demandée avec le run qui l'a dessinée : immuable
+        r_wet = client.get(f"/v1/rain-nowcast/tiles/{wet_epoch}/8/{tx}/{ty}.png?run={run_epoch}")
         assert r_wet.status_code == 200
         assert r_wet.headers["content-type"] == "image/png"
         assert r_wet.headers["cache-control"] == "public, max-age=3600, immutable"
+        assert r_wet.headers["x-piaf-run"] == str(run_epoch)
         assert read_png(r_wet.content)[py, px] == 5
+
+        # Sans run, ou avec un autre run : la même image, gardée 60 s seulement (le run suivant redessine cet instant)
+        for query in ("", f"?run={run_epoch - 300}", f"?run={run_epoch + 300}"):
+            r_other = client.get(f"/v1/rain-nowcast/tiles/{wet_epoch}/8/{tx}/{ty}.png{query}")
+            assert r_other.status_code == 200
+            assert r_other.headers["cache-control"] == "public, max-age=60"
+            assert r_other.headers["x-piaf-run"] == str(run_epoch)
+            assert r_other.content == r_wet.content
 
         # Tuile sèche sur Paris (+5 min) -> transparente
         r_dry = client.get(f"/v1/rain-nowcast/tiles/{dry_epoch}/8/{tx}/{ty}.png")
