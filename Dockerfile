@@ -26,4 +26,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8000/v1/health || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# --timeout-keep-alive 75 : uvicorn ferme sinon une connexion inactive après 5 s, comme le client httpx de Vigie API la garde 5 s ;
+# à ~94 ms d'aller-retour, une requête partie entre 4,9 et 5 s de repos tombait sur la fermeture (« Server disconnected without
+# sending a response », mesuré le 24/11/2026). Le serveur doit garder une connexion plus longtemps que ses clients.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--timeout-keep-alive", "75"]
