@@ -1,0 +1,10 @@
+# Chaque jour à 05 h 20, après la sauvegarde de Vigie (03 h 33) et le redémarrage automatique éventuel (04 h 30).
+[Unit]
+Description=Ménage quotidien des morceaux périmés d'Open-Meteo
+
+[Timer]
+OnCalendar=*-*-* 05:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
