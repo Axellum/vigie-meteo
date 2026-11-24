@@ -1,0 +1,12 @@
+# Ménage des morceaux périmés d'Open-Meteo (France sur le disque de démarrage, monde sur son volume à part).
+# Installé dans /etc/systemd/system, lancé par om-menage-morceaux.timer. Voir om_menage_morceaux.sh.
+[Unit]
+Description=Ménage des morceaux périmés d'Open-Meteo
+After=docker.service
+RequiresMountsFor=/var/lib/docker
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/om_menage_morceaux.sh /var/lib/docker/volumes/oracle_open_meteo_data/_data /mnt/om-monde/data
+Nice=10
+IOSchedulingClass=idle

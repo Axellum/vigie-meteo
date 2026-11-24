@@ -125,7 +125,7 @@ Mesuré le 22/11/2026 sur une VM Ampere A1 (4 OCPU, 24 Go) :
 
 | | |
 |---|---|
-| Place sur le disque | ~83 Go (dont 10,5 Go de relief à 90 m) : un volume de 100 Go suffit |
+| Place sur le disque | ~83 Go le 22/11 (dont 10,5 Go de relief à 90 m), puis +3 à 4 Go par jour tant que les vieux morceaux restaient (voir « Ménage des vieux morceaux ») ; volume passé à 200 Go le 24/11/2026 |
 | Synchro en continu | ½ cœur, ~500 Mo de RAM ; un passage d'ECMWF 9 km prend ~25 min (disque à ~50 Mo/s) |
 | Débit de l'API | ~7 req/s à froid (lecture du disque), 790 à 840 req/s une fois en cache (4,5 Go de cache) |
 | Qualité | 0,99 °C d'écart moyen à 49 aéroports (METAR), contre 0,97 °C pour l'API publique |
@@ -147,3 +147,23 @@ Mise en service :
 Les modèles gardés sont dans la commande de `open-meteo-world-sync`. ICON monde, UKMO monde et ARPEGE monde ont été
 retirés : ils prenaient 35 Go sans changer l'écart mesuré. Sans ICON Europe et D2, l'écart montait en Allemagne et en
 Suisse.
+
+## Ménage des vieux morceaux d'Open-Meteo (France et monde)
+
+Open-Meteo range chaque variable en morceaux de quelques jours (`chunk_N.om`). La synchro (`sync --past-days 2`) écrit
+les nouveaux morceaux mais ne retire jamais les anciens : le 24/11/2026, 14 Go des 24 Go de la France et 2,5 Go du monde
+n'étaient plus lus par personne, et le volume du monde grossissait de 3 à 4 Go par jour.
+
+`om_menage_morceaux.sh` retire, dans chaque dossier de variable, les morceaux qu'un morceau plus récent a remplacés et que
+la synchro n'a pas réécrits depuis 3 jours (`OM_MENAGE_JOURS`). Le dernier morceau d'une variable et les fichiers fixes
+(`static/`, relief) ne sont jamais touchés. Un client ne demande que les 24 dernières heures (`past_hours=24` dans Vigie),
+loin des 3 jours. L'API garde un fichier retiré ouvert jusqu'à 10 minutes après son dernier accès : la place revient
+ensuite (constaté le 24/11/2026).
+
+```bash
+sudo install -m 0755 om_menage_morceaux.sh /usr/local/sbin/
+sudo install -m 0644 om-menage-morceaux.service om-menage-morceaux.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now om-menage-morceaux.timer   # chaque jour à 05 h 20
+sudo om_menage_morceaux.sh --a-blanc /var/lib/docker/volumes/oracle_open_meteo_data/_data /mnt/om-monde/data
+journalctl -u om-menage-morceaux.service                                               # ce qui a été retiré
+```
