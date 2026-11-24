@@ -1,0 +1,10 @@
+# Toutes les 15 minutes : un fichier que la synchro vient de réécrire est froid au plus un quart d'heure.
+[Unit]
+Description=Préchauffage d'Open-Meteo France toutes les 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*:0/15
+
+[Install]
+WantedBy=timers.target
