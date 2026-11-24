@@ -132,7 +132,7 @@ Mesuré le 22/11/2026 sur une VM Ampere A1 (4 OCPU, 24 Go) :
 
 Mise en service :
 
-1. Créer un volume de bloc de 100 Go, le monter (par ex. `/mnt/om-monde`, ligne `nofail` dans `/etc/fstab`).
+1. Créer un volume de bloc de 200 Go (100 Go étaient pleins au bout de trois jours, avant le ménage des vieux morceaux), le monter (par ex. `/mnt/om-monde`, ligne `nofail` dans `/etc/fstab`).
    Jamais sur le disque de démarrage : le script refuse.
 2. Fichiers fixes, que la synchro n'apporte pas (relief, grilles d'ICON) :
    ```bash
