@@ -1,0 +1,10 @@
+# Préchauffage d'Open-Meteo France dans le cache de l'API. Installé dans /etc/systemd/system, lancé par
+# om-prechauffer.timer. Voir om_prechauffer.sh.
+[Unit]
+Description=Préchauffage d'Open-Meteo France
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/om_prechauffer.sh

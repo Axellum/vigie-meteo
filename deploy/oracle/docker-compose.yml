@@ -47,10 +47,13 @@ services:
     # Sur Oracle, la chaîne DOCKER-USER bloque l'interface publique et autorise WireGuard (wg0)
     ports:
       - "8080:8080"
+    # La limite compte le cache disque. om_prechauffer.sh (toutes les 15 min) y garde la météo lue par Vigie (AROME HD, ses
+    # quarts d'heure, ARPEGE : ~5 Go) : 40 points neufs en 8 ms de médiane au lieu de 293 ms (24/11/2026). 12 Go laissent
+    # de la place au reste (mer, passé).
     deploy:
       resources:
         limits:
-          memory: 5G
+          memory: 12G
 
   # --- Open-Meteo pour le monde entier (profil « monde ») ---------------------------------------------------------
   # Données sur un disque à part, monté sur OM_WORLD_DATA (200 Go depuis le 24/11/2026, ~80 Go utilisés) : jamais sur
@@ -150,8 +153,9 @@ services:
     # Sur Oracle, la chaîne DOCKER-USER bloque l'interface publique et autorise WireGuard (wg0)
     ports:
       - "8000:8000"
-    # PIAF : 125 Mo de carte par processus (2), pic mesuré 178 Mo pendant un chargement (17/11/2026)
+    # PIAF : 125 Mo de carte par processus (2), pic mesuré 178 Mo pendant un chargement (17/11/2026). 724 Mo utilisés le
+    # 24/11/2026 : 2 Go laissent de la marge (et la place d'un cache de tuiles).
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G

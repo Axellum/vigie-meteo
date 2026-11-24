@@ -174,3 +174,22 @@ sudo systemctl daemon-reload && sudo systemctl enable --now om-menage-morceaux.t
 sudo om_menage_morceaux.sh --a-blanc /var/lib/docker/volumes/oracle_open_meteo_data/_data /mnt/om-monde/data
 journalctl -u om-menage-morceaux.service                                               # ce qui a été retiré
 ```
+
+## Préchauffage d'Open-Meteo France
+
+La synchro écrit les fichiers dans son propre conteneur (limite de 2 Go) : leur cache s'en va vite, et le premier point
+demandé ensuite lit le disque (~50 Mo/s). Le 24/11/2026, 11 % des données de la France seulement étaient en mémoire, et
+40 points neufs répondaient en 293 ms de médiane (722 ms au 9e décile).
+
+`om_prechauffer.sh` lit, dans le conteneur de l'API (le cache est compté dans sa limite de 12 Go), les morceaux réécrits
+depuis 48 heures des modèles que Vigie lit pour la météo : AROME HD, ses quarts d'heure et ARPEGE, ~5 Go. Premier
+passage : 55 s ; ensuite moins d'une seconde. Après : 40 points neufs en 8 ms de médiane (9 ms au 9e décile). La mer
+(MFWAM) répondait déjà en 2,5 ms à froid et n'est pas préchauffée. `posix_fadvise(WILLNEED)` ne chargeait qu'un tiers
+des fichiers : ils sont vraiment lus.
+
+```bash
+sudo install -m 0755 om_prechauffer.sh /usr/local/sbin/
+sudo install -m 0644 om-prechauffer.service om-prechauffer.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now om-prechauffer.timer   # toutes les 15 minutes
+journalctl -u om-prechauffer.service                                               # « N morceaux, X Go lus en Y s »
+```
