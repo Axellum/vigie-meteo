@@ -53,7 +53,7 @@ services:
           memory: 5G
 
   # --- Open-Meteo pour le monde entier (profil « monde ») ---------------------------------------------------------
-  # Données sur un disque à part, monté sur OM_WORLD_DATA (100 Go, ~83 Go utilisés, mesuré le 22/11/2026) : jamais sur
+  # Données sur un disque à part, monté sur OM_WORLD_DATA (200 Go depuis le 24/11/2026, ~80 Go utilisés) : jamais sur
   # le disque de démarrage. Les fichiers fixes (relief 90 m, grilles d'ICON) viennent de monde_fichiers_fixes.sh, pas de
   # la synchro. Modèles gardés après mesure contre 49 aéroports : ECMWF IFS 9 km, GFS, probabilités GEFS et ECMWF, CAMS,
   # ICON Europe et D2, et les régionaux HRRR, HRDPS, JMA, DMI, KNMI, MeteoSwiss (0,99 °C d'écart moyen, comme le jeu
@@ -68,11 +68,38 @@ services:
       CACHE_SIZE: 2GB
     volumes:
       - ${OM_WORLD_DATA:-/mnt/om-monde/data}:/app/data
-    # --concurrent 2 : le disque plafonne vers 50 Mo/s, plus de téléchargements en parallèle n'iraient pas plus vite.
+    # Variables triées le 24/11/2026 par un essai champ par champ des requêtes de Vigie (104 points, API d'essai où une
+    # variable est masquée, comparée à la production) : lifted_index et uv_index_clear_sky ne changeaient rien, retirés.
+    # direct_radiation et diffuse_radiation restent : ICON Europe et D2 calculent le rayonnement global avec les deux.
+    # cape, convective_inhibition et visibility servent au code du temps (orages, brouillard).
+    # ECMWF IFS 9 km et GFS 0,11° (les trois quarts du volume) ont leur propre synchro, juste après.
+    # --concurrent 1 ici et 1 là-bas : 2 téléchargements à la fois comme avant, le disque plafonne vers 50 Mo/s.
     command: >
-      sync ecmwf_ifs,ncep_gfs013,ncep_gfs025,ncep_gefs025,ecmwf_ifs025_ensemble,cams_global,cams_europe,dwd_icon_eu,dwd_icon_d2,ncep_hrrr_conus,cmc_gem_hrdps,jma_msm,jma_gsm,dmi_harmonie_arome_europe,knmi_harmonie_arome_europe,meteoswiss_icon_ch1
-      temperature_2m,apparent_temperature,relative_humidity_2m,dew_point_2m,pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,wind_u_component_10m,wind_v_component_10m,wind_gusts_10m,precipitation,rain,showers,snowfall,snowfall_water_equivalent,weather_code,uv_index,uv_index_clear_sky,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,shortwave_radiation,direct_radiation,diffuse_radiation,cape,lifted_index,convective_inhibition,precipitation_probability,visibility,is_day,sunshine_duration,frozen_precipitation_percent,pm10,pm2_5,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide,dust,aerosol_optical_depth,european_aqi,us_aqi
-      --past-days 2 --repeat-interval 60 --concurrent 2
+      sync ncep_gfs025,ncep_gefs025,ecmwf_ifs025_ensemble,cams_global,cams_europe,dwd_icon_eu,dwd_icon_d2,ncep_hrrr_conus,cmc_gem_hrdps,jma_msm,jma_gsm,dmi_harmonie_arome_europe,knmi_harmonie_arome_europe,meteoswiss_icon_ch1
+      temperature_2m,apparent_temperature,relative_humidity_2m,dew_point_2m,pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,wind_u_component_10m,wind_v_component_10m,wind_gusts_10m,precipitation,rain,showers,snowfall,snowfall_water_equivalent,weather_code,uv_index,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,shortwave_radiation,direct_radiation,diffuse_radiation,cape,convective_inhibition,precipitation_probability,visibility,is_day,sunshine_duration,frozen_precipitation_percent,pm10,pm2_5,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide,dust,aerosol_optical_depth,european_aqi,us_aqi
+      --past-days 2 --repeat-interval 60 --concurrent 1
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  # ECMWF IFS 9 km et GFS 0,11° à part : sans le rayonnement direct d'ECMWF (2,6 Go) ni le diffus de GFS 0,11° (1,8 Go),
+  # que Vigie n'utilise pas (même essai : aucune valeur changée sans eux), alors qu'ICON a besoin des deux.
+  # GFS 0,11° reste indispensable : sans lui, plus d'UV ni de températures max/min sur 83 % des jours (même essai).
+  open-meteo-world-sync-lourds:
+    image: ghcr.io/open-meteo/open-meteo:latest
+    container_name: open-meteo-world-sync-lourds
+    profiles: ["monde"]
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: info
+      CACHE_SIZE: 2GB
+    volumes:
+      - ${OM_WORLD_DATA:-/mnt/om-monde/data}:/app/data
+    command: >
+      sync ecmwf_ifs,ncep_gfs013
+      temperature_2m,apparent_temperature,relative_humidity_2m,dew_point_2m,pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,wind_u_component_10m,wind_v_component_10m,wind_gusts_10m,precipitation,rain,showers,snowfall,snowfall_water_equivalent,weather_code,uv_index,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,shortwave_radiation,cape,convective_inhibition,precipitation_probability,visibility,is_day,frozen_precipitation_percent
+      --past-days 2 --repeat-interval 60 --concurrent 1
     deploy:
       resources:
         limits:

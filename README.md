@@ -144,7 +144,14 @@ Mise en service :
    ```
 4. Le port 8081 ne doit être ouvert qu'au tunnel du client (même règle que 8080) ; l'interface publique reste fermée.
 
-Les modèles gardés sont dans la commande de `open-meteo-world-sync`. ICON monde, UKMO monde et ARPEGE monde ont été
+Les modèles gardés sont dans les commandes de `open-meteo-world-sync` et de `open-meteo-world-sync-lourds` (ECMWF IFS
+9 km et GFS 0,11°, les trois quarts du volume, synchronisés à part pour ne pas copier le rayonnement direct d'ECMWF ni
+le diffus de GFS, qu'aucune requête de Vigie n'utilise alors qu'ICON a besoin des deux). Les variables ont été triées le
+24/11/2026 par un essai champ par champ : une API d'essai, où la variable est masquée par un dossier vide, comparée à la
+production sur les requêtes exactes de Vigie en 104 points. `lifted_index`, `uv_index_clear_sky`, le direct d'ECMWF et
+le diffus de GFS 0,11° ne changeaient aucune valeur (≈ 5,7 Go) ; tout le reste changeait au moins un champ (code du
+temps, rayonnement, température ressentie). Sans GFS 0,11°, l'UV et les températures max/min disparaissaient sur 83 %
+des jours : il reste. ICON monde, UKMO monde et ARPEGE monde ont été
 retirés : ils prenaient 35 Go sans changer l'écart mesuré. Sans ICON Europe et D2, l'écart montait en Allemagne et en
 Suisse.
 
