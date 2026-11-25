@@ -346,7 +346,9 @@ def test_health_says_whether_the_run_is_fresh(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("hours_after", [0, 1, 5])
 def test_no_step_is_served_after_the_last_one(tmp_path: Path, hours_after: int) -> None:
-    run_time = recent_run(minutes_ago=60 * hours_after + 20)
+    # Pas ramené à l'heure pleine (`recent_run`) : le run de « il y a 5 h 20 » aurait plus de 6 h entre hh:00 et hh:20,
+    # donc plus aucune échéance à servir (503 ; vu le 25/11/2026 à 17 h 16 UTC).
+    run_time = datetime.now(UTC) - timedelta(hours=hours_after, minutes=20)
     with api_client(tmp_path, make_run(run_time), max_age=400) as client:
         resp = client.get("/v1/shortterm", params={"lat": PARIS[0], "lon": PARIS[1]})
         assert resp.status_code == 200

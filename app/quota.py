@@ -10,9 +10,13 @@ Ici, une seule comptabilité, partagée par les processus dans un petit fichier 
   météo des forêts, qu'un visiteur attend ;
 - un petit écart minimal entre deux requêtes (`min_gap`), pour que le premier tour ne parte pas en rafale ;
 - après un 429, plus aucune requête ne part **vers la même API** (`/public/pearome/...` : `pearome`) avant la fin du délai
-  demandé (`Retry-After`, sinon 30 s doublées à chaque refus de suite, 120 s au plus) : tous les processus attendent, personne
-  ne reboucle sur un refus, et la pluie PIAF ou le radar ne paient pas le refus d'une prévision d'ensemble (vu le 25/11/2026 :
-  43 refus en 2 h 30 (35 PE-AROME, puis 8 PE-ARPEGE), sans `Retry-After`, et chacun arrêtait tout 30 s).
+  demandé (`Retry-After`, sinon 30 s doublées à chaque refus de suite) : tous les processus attendent, personne ne reboucle
+  sur un refus, et la pluie PIAF ou le radar ne paient pas le refus d'une prévision d'ensemble (vu le 25/11/2026 : 43 refus
+  en 2 h 30 (35 PE-AROME, puis 8 PE-ARPEGE), sans `Retry-After`, et chacun arrêtait tout 30 s) ;
+- l'attente monte à 120 s au plus pour ce qu'un visiteur attend, à 30 min pour les produits en gros : le soir du 25/11/2026,
+  PE-AROME refusait chaque essai alors qu'une seule requête par minute partait vers lui (sa limite n'est donc pas un débit à
+  la minute), et redemander toutes les 2 min faisait 30 refus par heure pour rien. Un run d'ensemble ne vient que toutes les
+  quelques heures : 30 min de retard au pire ne se voient pas.
 
 Chaque 429 est écrit au journal avec le nombre de requêtes parties dans la fenêtre (toutes, et vers cette API) et les en-têtes
 de limite du portail s'il en donne : de quoi trouver la vraie limite d'une API.
@@ -44,7 +48,8 @@ log = logging.getLogger(__name__)
 HOST_SUFFIX = "meteofrance.fr"
 # Des produits qui coûtent des centaines de requêtes par run : ils ne prennent pas les places réservées à la pluie PIAF et au radar.
 BULK_PATH_MARKERS = ("/aromepi/", "/pearome/", "/pearpege/", "/DPPaquetAROME-OM/")
-MAX_COOLDOWN_S = 120.0
+MAX_COOLDOWN_S = 120.0  # attente la plus longue après des refus de suite : pluie PIAF, radar, DPClim, météo des forêts
+MAX_BULK_COOLDOWN_S = 1800.0  # la même pour les produits en gros (`BULK_PATH_MARKERS`)
 LIMIT_HEADER_WORDS = ("ratelimit", "rate-limit", "retry-after", "quota", "throttl")  # en-têtes de limite recopiés au journal
 
 
@@ -156,8 +161,10 @@ class SharedQuota:
                 raise
         return seconds
 
-    def refused(self, api: str, retry_after: float | None = None) -> tuple[float, int]:
+    def refused(self, api: str, retry_after: float | None = None, bulk: bool = False) -> tuple[float, int]:
         """Un 429 de `api` : la bloque `Retry-After` secondes, sinon 30 s doublées à chaque refus de suite ; rend (attente, refus de suite).
+
+        L'attente est plafonnée à `MAX_COOLDOWN_S`, ou à `MAX_BULK_COOLDOWN_S` pour un produit en gros (`bulk`).
 
         Un 429 qui arrive alors que l'API est déjà bloquée vient d'une requête partie avant le blocage (les autres attendent sa
         fin) : il ne compte pas comme un refus de plus.
@@ -177,7 +184,7 @@ class SharedQuota:
                         (f"strikes:{api}", float(strikes)),
                     )
                 wanted = retry_after if retry_after is not None else self.default_cooldown * 2 ** (strikes - 1)
-                seconds = min(max(wanted, 1.0), MAX_COOLDOWN_S)
+                seconds = min(max(wanted, 1.0), MAX_BULK_COOLDOWN_S if bulk else MAX_COOLDOWN_S)
                 self._block_until(api, now + seconds)
                 self._conn.execute("COMMIT")
             except BaseException:
@@ -227,7 +234,8 @@ class SharedQuota:
             api = api_of(response.request.url.path)
             if response.status_code == 429:
                 raw = response.headers.get("retry-after", "").strip()
-                seconds, strikes = self.refused(api, float(raw) if raw.isdigit() else None)
+                bulk = is_bulk(response.request.url.path)
+                seconds, strikes = self.refused(api, float(raw) if raw.isdigit() else None, bulk=bulk)
                 total, mine = self.recent(api)
                 log.warning(
                     "Météo-France : 429 de %s (%d de suite), plus aucune requête vers cette API pendant %.0f s ; "

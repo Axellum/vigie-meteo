@@ -139,7 +139,27 @@ async def test_a_429_makes_the_same_api_wait_for_the_delay_and_lets_the_others_g
 async def test_refusals_in_a_row_without_retry_after_wait_twice_as_long_each_time_until_an_answer(tmp_path: Path) -> None:
     clock = Clock()
     quota = quota_on(tmp_path, clock)
-    answers = [httpx.Response(429), httpx.Response(429), httpx.Response(429), httpx.Response(429), httpx.Response(200), httpx.Response(429)]
+    answers = [httpx.Response(429)] * 8 + [httpx.Response(200), httpx.Response(429)]
+    sent_at: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent_at.append(clock.now)
+        return answers.pop(0)
+
+    async with make_client(quota, handler) as client:
+        for _ in range(10):
+            await client.get(PEAROME)
+    gaps = [round(b - a) for a, b in zip(sent_at, sent_at[1:], strict=False)]
+    # 30 s, puis le double, 30 min au plus pour une prévision d'ensemble ; une réponse acceptée remet le compte à zéro
+    assert gaps == [30, 60, 120, 240, 480, 960, 1800, 1800, 0]
+    assert quota.try_acquire(api="pearome") == pytest.approx(30.0)  # le dernier refus est le premier d'une série : 30 s
+
+
+async def test_what_a_visitor_waits_for_is_asked_again_within_two_minutes(tmp_path: Path) -> None:
+    """La pluie PIAF ou le radar refusés plusieurs fois de suite : 120 s d'attente au plus, pas les 30 min des produits en gros."""
+    clock = Clock()
+    quota = quota_on(tmp_path, clock)
+    answers = [httpx.Response(429)] * 5 + [httpx.Response(200)]
     sent_at: list[float] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -148,10 +168,8 @@ async def test_refusals_in_a_row_without_retry_after_wait_twice_as_long_each_tim
 
     async with make_client(quota, handler) as client:
         for _ in range(6):
-            await client.get(PEAROME)
-    gaps = [round(b - a) for a, b in zip(sent_at, sent_at[1:], strict=False)]
-    assert gaps == [30, 60, 120, 120, 0]  # 30 s, puis le double, 120 s au plus ; une réponse acceptée remet le compte à zéro
-    assert quota.try_acquire(api="pearome") == pytest.approx(30.0)  # le dernier refus est le premier d'une série : 30 s
+            await client.get(PIAF)
+    assert [round(b - a) for a, b in zip(sent_at, sent_at[1:], strict=False)] == [30, 60, 120, 120, 120]
 
 
 async def test_refusals_of_requests_already_sent_count_once(tmp_path: Path) -> None:
