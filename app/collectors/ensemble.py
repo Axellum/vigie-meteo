@@ -18,6 +18,10 @@ valable (la même requête repasse une seconde plus tard) : ces 400 sont rejoué
 Quota du portail : 50 requêtes par minute pour toute la clé (PIAF, AROME-PI et le radar en prennent aussi) : chaque lecteur espace ses requêtes,
 et un seul processus télécharge (verrou de fichier). Les cartes sont réduites aussitôt (`app/ensemble_grid.py`) : un run tient en quelques Mo.
 Un run incomplet n'est jamais servi.
+
+Chaque carte déjà lue d'un run en cours est gardée sur disque (`partial/<run>/`, un `.npy` de 70 Ko par carte réduite) : un
+redémarrage de la passerelle reprend où il en était au lieu de redemander les 119 (ou 140) cartes. Le 25/11/2026, deux
+redémarrages en pleine panne de PE-AROME (des 429 de leur serveur de données pendant des heures) avaient perdu ce qui était lu.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ import contextlib
 import logging
 import os
 import re
+import shutil
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -102,10 +107,25 @@ AROME_PRODUCTS = (
 ARPEGE_HOURS = (24, 48, 72, 96)
 ARPEGE_THRESHOLDS_MM = {"rain_1mm": 1.0, "rain_5mm": 5.0, "rain_10mm": 10.0, "rain_20mm": 20.0}
 ARPEGE_COVERAGE = "TOTAL_PRECIPITATION__GROUND_OR_WATER_SURFACE___{run}_P1D"
+PARTIAL_MAX_AGE_S = 2 * 86400  # les cartes d'un run jamais fini : jetées après 2 jours
+
+
+def geometry_to_array(g: GridGeometry) -> np.ndarray:
+    return np.array([g.lat0, g.lon0, g.dlat, g.dlon, g.nj, g.ni, g.pool], dtype=np.float64)
+
+
+def geometry_from_array(values: np.ndarray) -> GridGeometry:
+    lat0, lon0, dlat, dlon, nj, ni, pool = (float(x) for x in values)
+    return GridGeometry(lat0, lon0, dlat, dlon, int(nj), int(ni), int(pool))
+
+
+def pooled_shape(g: GridGeometry) -> tuple[int, int]:
+    """La forme d'une carte réduite par `pool_mean` (bords prolongés : arrondi au-dessus)."""
+    return (-(-g.nj // g.pool), -(-g.ni // g.pool))
 
 
 class ProbabilityStore:
-    """Les runs complets sur disque (un `.npz` par run) et le dernier en mémoire."""
+    """Les runs complets sur disque (un `.npz` par run) et le dernier en mémoire ; les cartes d'un run en cours dans `partial/<run>/`."""
 
     def __init__(self, directory: str | Path, keep_runs: int = 3) -> None:
         self.directory = Path(directory)
@@ -114,6 +134,35 @@ class ProbabilityStore:
 
     def _path(self, epoch: int) -> Path:
         return self.directory / f"{epoch}.npz"
+
+    def _partial_dir(self, epoch: int) -> Path:
+        return self.directory / "partial" / str(epoch)
+
+    def save_piece(self, epoch: int, name: str, array: np.ndarray) -> None:
+        """Une carte déjà lue du run `epoch` (ou sa géométrie), écrite d'un coup : un redémarrage la retrouve."""
+        folder = self._partial_dir(epoch)
+        folder.mkdir(parents=True, exist_ok=True)
+        tmp = folder / f"{name}.tmp"
+        with open(tmp, "wb") as handle:
+            np.save(handle, array, allow_pickle=False)
+        os.replace(tmp, folder / f"{name}.npy")
+
+    def load_pieces(self, epoch: int) -> dict[str, np.ndarray]:
+        """Les cartes déjà lues du run `epoch` ; un fichier illisible est jeté (la carte sera redemandée)."""
+        folder = self._partial_dir(epoch)
+        pieces: dict[str, np.ndarray] = {}
+        if not folder.is_dir():
+            return pieces
+        for entry in folder.glob("*.npy"):
+            try:
+                pieces[entry.stem] = np.load(entry, allow_pickle=False)
+            except (ValueError, OSError, EOFError):
+                with contextlib.suppress(OSError):
+                    entry.unlink()
+        return pieces
+
+    def drop_pieces(self, epoch: int) -> None:
+        shutil.rmtree(self._partial_dir(epoch), ignore_errors=True)
 
     def epochs(self) -> list[int]:
         if not self.directory.is_dir():
@@ -129,8 +178,7 @@ class ProbabilityStore:
         epoch = int(run.run.timestamp())
         target = self._path(epoch)
         tmp = target.with_suffix(".tmp")
-        g = run.geometry
-        arrays: dict[str, np.ndarray] = {"geometry": np.array([g.lat0, g.lon0, g.dlat, g.dlon, g.nj, g.ni, g.pool], dtype=np.float64)}
+        arrays: dict[str, np.ndarray] = {"geometry": geometry_to_array(run.geometry)}
         for key, layer in run.layers.items():
             arrays[f"L_{key}"] = layer
             arrays[f"H_{key}"] = np.array(run.hours[key], dtype=np.int32)
@@ -141,14 +189,13 @@ class ProbabilityStore:
     def load(self, epoch: int) -> ProbabilityRun | None:
         try:
             with np.load(self._path(epoch)) as data:
-                lat0, lon0, dlat, dlon, nj, ni, pool = (float(x) for x in data["geometry"])
+                geometry = geometry_from_array(data["geometry"])
                 layers = {name[2:]: data[name] for name in data.files if name.startswith("L_")}
                 hours = {key: tuple(int(h) for h in data[f"H_{key}"]) for key in layers}
         except (FileNotFoundError, ValueError, KeyError, OSError):
             return None
         if not layers or any(layer.shape[0] != len(hours[key]) for key, layer in layers.items()):
             return None
-        geometry = GridGeometry(lat0, lon0, dlat, dlon, int(nj), int(ni), int(pool))
         return ProbabilityRun(datetime.fromtimestamp(epoch, tz=UTC), geometry, hours, layers)
 
     def latest(self) -> ProbabilityRun | None:
@@ -177,6 +224,14 @@ class ProbabilityStore:
                 with contextlib.suppress(OSError):
                     if stale.stat().st_mtime < time.time() - 3600:
                         stale.unlink()
+        epochs = self.epochs()
+        newest = epochs[-1] if epochs else 0
+        partial = self.directory / "partial"
+        if partial.is_dir():  # les cartes d'un run déjà gardé, ou d'un run jamais fini depuis 2 jours
+            for folder in partial.iterdir():
+                with contextlib.suppress(OSError, ValueError):
+                    if int(folder.name) <= newest or folder.stat().st_mtime < time.time() - PARTIAL_MAX_AGE_S:
+                        shutil.rmtree(folder, ignore_errors=True)
         return removed
 
 
@@ -326,6 +381,7 @@ class _EnsembleCollector:
                 continue
             loaded = await self._download(run)
             self.store.save(loaded)
+            self.store.drop_pieces(int(run.timestamp()))
             self.store.purge()
             self.last_success_at = now
             self.last_error = None
@@ -337,6 +393,11 @@ class _EnsembleCollector:
 
     async def _download(self, run: datetime) -> ProbabilityRun:
         raise NotImplementedError
+
+    def _forget(self, epoch: int) -> None:
+        """Des cartes qui ne collent pas entre elles : on oublie tout le run en cours, le prochain essai repart de zéro."""
+        self._partial_run = None
+        self.store.drop_pieces(epoch)
 
     async def run_forever(self) -> None:
         """Tâche de fond : une vérification par minute, un téléchargement seulement quand un run est dû."""
@@ -363,9 +424,25 @@ class PeAromeCollector(_EnsembleCollector):
     async def _run_listed(self, run: datetime) -> bool:
         return await self._exists(self._settings.meteofrance_pearome_url, AROME_PRODUCTS[0].coverage.format(run=run_stamp(run)))
 
+    def _resume(self, run: datetime) -> None:
+        """Reprend les cartes de `run` déjà lues avant un redémarrage (`partial/<run>/`) ; rien si elles ne collent pas."""
+        pieces = self.store.load_pieces(int(run.timestamp()))
+        if "geometry" not in pieces:
+            return
+        geometry = geometry_from_array(pieces.pop("geometry"))
+        wanted = {f"{p.key}_{h}": (p.key, h) for p in AROME_PRODUCTS for h in p.hours}
+        self._geometry = geometry
+        for name, values in pieces.items():
+            if name in wanted and values.shape == pooled_shape(geometry) and values.dtype == np.uint8:
+                self._partial[wanted[name]] = values
+        if self._partial:
+            log.info("%s : %d cartes du run %s reprises du disque", self.name, len(self._partial), run_stamp(run))
+
     async def _download(self, run: datetime) -> ProbabilityRun:
+        epoch = int(run.timestamp())
         if self._partial_run != run:
             self._partial_run, self._partial, self._geometry = run, {}, None
+            self._resume(run)
         sem = asyncio.Semaphore(self._settings.pearome_concurrency)
 
         async def one(product: Product, hour: int) -> None:
@@ -376,9 +453,13 @@ class PeAromeCollector(_EnsembleCollector):
             geometry = GridGeometry.of(grid, AROME_POOL)
             if self._geometry is None:
                 self._geometry = geometry
+                self.store.save_piece(epoch, "geometry", geometry_to_array(geometry))
             elif geometry != self._geometry:
+                self._forget(epoch)
                 raise ValueError(f"cartes PE-AROME de géométries différentes dans le run {run_stamp(run)}")
-            self._partial[(product.key, hour)] = to_percent(pool_mean(grid.values, AROME_POOL))
+            values = to_percent(pool_mean(grid.values, AROME_POOL))
+            self.store.save_piece(epoch, f"{product.key}_{hour}", values)
+            self._partial[(product.key, hour)] = values
 
         try:
             async with asyncio.TaskGroup() as group:  # la première échéance qui échoue arrête les autres : pas de requêtes perdues
@@ -416,9 +497,32 @@ class PeArpegeCollector(_EnsembleCollector):
     async def _run_listed(self, run: datetime) -> bool:
         return await self._exists(self._member_url(0), ARPEGE_COVERAGE.format(run=run_stamp(run)))
 
+    def _add(self, hour: int, member: int, above: np.ndarray) -> None:
+        """Compte un membre (`above[seuil]` = 1 là où il dépasse le seuil) ; pas d'attente au milieu : jamais compté deux fois."""
+        counts = self._counts.setdefault(hour, np.zeros(above.shape, dtype=np.uint8))
+        counts += above
+        self._done.add((hour, member))
+
+    def _resume(self, run: datetime) -> None:
+        """Reprend les membres de `run` déjà lus avant un redémarrage (`partial/<run>/`) ; rien si ils ne collent pas."""
+        pieces = self.store.load_pieces(int(run.timestamp()))
+        if "geometry" not in pieces:
+            return
+        geometry = geometry_from_array(pieces.pop("geometry"))
+        shape = (len(ARPEGE_THRESHOLDS_MM), geometry.nj, geometry.ni)
+        wanted = {f"h{h}_m{m:03d}": (h, m) for h in ARPEGE_HOURS for m in range(MEMBERS)}
+        self._geometry = geometry
+        for name, above in pieces.items():
+            if name in wanted and above.shape == shape and above.dtype == np.uint8:
+                self._add(*wanted[name], above)
+        if self._done:
+            log.info("%s : %d cartes du run %s reprises du disque", self.name, len(self._done), run_stamp(run))
+
     async def _download(self, run: datetime) -> ProbabilityRun:
+        epoch = int(run.timestamp())
         if self._partial_run != run:
             self._partial_run, self._counts, self._done, self._geometry = run, {}, set(), None
+            self._resume(run)
         sem = asyncio.Semaphore(self._settings.pearp_concurrency)
         thresholds = tuple(ARPEGE_THRESHOLDS_MM.values())
 
@@ -434,12 +538,13 @@ class PeArpegeCollector(_EnsembleCollector):
             geometry = GridGeometry.of(grid, 1)
             if self._geometry is None:
                 self._geometry = geometry
+                self.store.save_piece(epoch, "geometry", geometry_to_array(geometry))
             elif geometry != self._geometry:
+                self._forget(epoch)
                 raise ValueError(f"cartes PE-ARPEGE de géométries différentes dans le run {run_stamp(run)}")
-            counts = self._counts.setdefault(hour, np.zeros((len(thresholds), *grid.values.shape), dtype=np.uint8))
-            for t, threshold in enumerate(thresholds):
-                counts[t] += grid.values >= threshold
-            self._done.add((hour, member))  # pas d'attente entre l'addition et cette ligne : un membre n'est jamais compté deux fois
+            above = np.stack([grid.values >= threshold for threshold in thresholds]).astype(np.uint8)
+            self.store.save_piece(epoch, f"h{hour}_m{member:03d}", above)
+            self._add(hour, member, above)
 
         try:
             async with asyncio.TaskGroup() as group:

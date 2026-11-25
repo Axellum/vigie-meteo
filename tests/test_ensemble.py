@@ -226,6 +226,38 @@ async def test_pe_arome_an_incomplete_run_is_never_served_and_the_retry_skips_wh
     assert run is not None and run.point(*PARIS)["rain_1mm"][6] == 90  # type: ignore[index]
 
 
+async def test_pe_arome_a_restart_keeps_the_maps_already_read(tmp_path: Path) -> None:
+    """Le conteneur redémarre en plein téléchargement (25/11/2026 : deux fois pendant une panne de PE-AROME) : rien n'est redemandé."""
+    wcs = FakeAromeWcs()
+    wcs.broken = {("storm", 30)}
+    first = arome_collector(tmp_path, wcs)
+    assert await first.refresh(NOW) is False
+    partial = tmp_path / "pearome" / "partial" / str(int(datetime(2026, 11, 18, 9, tzinfo=UTC).timestamp()))
+    assert (partial / "geometry.npy").is_file()
+    kept = len(list(partial.glob("*.npy"))) - 1
+    assert kept > 10
+    wcs.broken = set()
+    wcs.requests.clear()
+    restarted = arome_collector(tmp_path, wcs)  # un nouveau processus : rien en mémoire
+    assert await restarted.refresh(NOW + 200) is True
+    gets = [r for r in wcs.requests if r.url.path.endswith("/GetCoverage")]
+    assert len(gets) == 119 - kept  # seules les cartes jamais gardées sont demandées
+    run = restarted.store.latest()
+    assert run is not None and run.point(*PARIS)["rain_1mm"][6] == 90 and run.point(*PARIS)["hail"][9] == 100  # type: ignore[index]
+    assert not partial.exists()  # le run est gardé entier : ses morceaux sont jetés
+
+
+async def test_pe_arome_pieces_that_do_not_fit_are_read_again(tmp_path: Path) -> None:
+    wcs = FakeAromeWcs()
+    collector = arome_collector(tmp_path, wcs)
+    epoch = int(datetime(2026, 11, 18, 9, tzinfo=UTC).timestamp())
+    collector.store.save_piece(epoch, "rain_1mm_6", np.zeros((3, 3), dtype=np.uint8))  # sans géométrie : ignoré
+    (tmp_path / "pearome" / "partial" / str(epoch) / "rain_5mm_3.npy").write_bytes(b"pas un tableau")
+    assert await collector.refresh(NOW) is True
+    assert len([r for r in wcs.requests if r.url.path.endswith("/GetCoverage")]) == 119
+    assert collector.store.latest().point(*PARIS)["rain_1mm"][6] == 90  # type: ignore[union-attr,index]
+
+
 async def test_pe_arome_a_failing_source_leaves_the_kept_run_and_hides_the_key(tmp_path: Path) -> None:
     wcs = FakeAromeWcs()
     collector = arome_collector(tmp_path, wcs)
@@ -263,6 +295,7 @@ class FakePearpWcs:
         self.requests: list[httpx.Request] = []
         self.flaky = 0
         self.published = True
+        self.missing_members: set[int] = set()  # membres dont les cartes répondent 404 (pas encore publiées)
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -274,6 +307,8 @@ class FakePearpWcs:
             self.flaky -= 1
             return httpx.Response(400, text=FLAKY_BODY)
         member = int(request.url.path.split("PEARP")[1][:3])
+        if member in self.missing_members:
+            return httpx.Response(404, text="<mw:fault/>")
         hour = int(next(s for s in request.url.params.get_list("subset") if s.startswith("time("))[5:-1]) // 3600
         return httpx.Response(200, content=_member_map(member, hour))
 
@@ -329,6 +364,26 @@ async def test_pe_arpege_a_persistent_400_is_given_up_not_looped(tmp_path: Path)
     assert collector.last_error is not None
     gets = len([r for r in wcs.requests if r.url.path.endswith("/GetCoverage")])
     assert gets <= (FLAKY_RETRIES + 1) * 4 + 4  # quelques tâches (la concurrence) ont essayé, la première erreur arrête le reste
+
+
+async def test_pe_arpege_a_restart_counts_each_member_once_without_reading_it_again(tmp_path: Path) -> None:
+    wcs = FakePearpWcs()
+    wcs.missing_members = {34}
+    first = arpege_collector(tmp_path, wcs)
+    assert await first.refresh(NOW_PEARP) is False
+    partial = tmp_path / "pearp" / "partial" / str(int(datetime(2026, 11, 18, 6, tzinfo=UTC).timestamp()))
+    kept = len(list(partial.glob("h*_m*.npy")))
+    assert kept > 10
+    wcs.missing_members = set()
+    wcs.requests.clear()
+    restarted = arpege_collector(tmp_path, wcs)
+    assert await restarted.refresh(NOW_PEARP + 200) is True
+    gets = len([r for r in wcs.requests if r.url.path.endswith("/GetCoverage")])
+    assert gets == 140 - kept  # seuls les membres jamais gardés sont demandés
+    point = restarted.store.latest().point(*PARIS_A)  # type: ignore[union-attr]
+    assert point is not None
+    assert point["rain_1mm"][48] == round(100 * 34 / 35) and point["rain_20mm"][48] == round(100 * 15 / 35)  # chaque membre une fois
+    assert restarted.store.latest().point(41.0, -6.0)["rain_20mm"][24] == 20  # type: ignore[union-attr,index]
 
 
 async def test_pe_arpege_an_unlisted_run_is_not_downloaded(tmp_path: Path) -> None:

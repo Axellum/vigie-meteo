@@ -13,13 +13,19 @@ Ici, une seule comptabilité, partagée par les processus dans un petit fichier 
   demandé (`Retry-After`, sinon 30 s doublées à chaque refus de suite) : tous les processus attendent, personne ne reboucle
   sur un refus, et la pluie PIAF ou le radar ne paient pas le refus d'une prévision d'ensemble (vu le 25/11/2026 : 43 refus
   en 2 h 30 (35 PE-AROME, puis 8 PE-ARPEGE), sans `Retry-After`, et chacun arrêtait tout 30 s) ;
-- l'attente monte à 120 s au plus pour ce qu'un visiteur attend, à 30 min pour les produits en gros : le soir du 25/11/2026,
-  PE-AROME refusait chaque essai alors qu'une seule requête par minute partait vers lui (sa limite n'est donc pas un débit à
-  la minute), et redemander toutes les 2 min faisait 30 refus par heure pour rien. Un run d'ensemble ne vient que toutes les
-  quelques heures : 30 min de retard au pire ne se voient pas.
+- l'attente monte à 120 s au plus pour ce qu'un visiteur attend, à 30 min pour les produits en gros quand on ne sait pas
+  d'où vient le refus (un run d'ensemble ne vient que toutes les quelques heures : 30 min de retard au pire ne se voient pas) ;
+- **sauf une panne de Météo-France** : un 429 dont le corps dit `<mw:code>868500</mw:code>` (« Synopsis backend error »)
+  vient de leur serveur de données, lui-même limité par son propre fond (il enveloppe un `900804 Message throttled out`),
+  pour tous les utilisateurs à la fois. Notre quota n'y est pour rien (PE-AROME : palier de 900 requêtes par minute dans la
+  clé, on en fait 12 au plus) et la panne va et vient : le 25/11/2026, PE-AROME a refusé ainsi de 18 h à 21 h 30 UTC passées,
+  mais répondait à 20 h 06 UTC, entre deux essais de 19 h 53 et 20 h 23 que l'attente de 30 min rendait aveugles. Après
+  ce refus-là, l'attente monte à 5 min au plus (`MAX_OUTAGE_COOLDOWN_S`) : une requête toutes les 5 min ne pèse rien chez eux
+  et attrape les moments où le service répond.
 
-Chaque 429 est écrit au journal avec le nombre de requêtes parties dans la fenêtre (toutes, et vers cette API) et les en-têtes
-de limite du portail s'il en donne : de quoi trouver la vraie limite d'une API.
+Chaque 429 est écrit au journal avec le nombre de requêtes parties dans la fenêtre (toutes, et vers cette API), les en-têtes
+de limite du portail s'il en donne et les codes d'erreur lus dans le corps du refus (`refusal_codes`) : de quoi distinguer
+notre quota d'une panne chez eux sans relancer une enquête.
 
 Choix du fichier SQLite plutôt qu'un verrou de fichier : le dépôt a déjà SQLite (WAL), il marche sous Windows comme sous Linux
 (les tests s'y lancent), et `BEGIN IMMEDIATE` donne l'exclusion entre processus et la lecture-puis-écriture du compteur d'un seul
@@ -35,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -50,7 +57,13 @@ HOST_SUFFIX = "meteofrance.fr"
 BULK_PATH_MARKERS = ("/aromepi/", "/pearome/", "/pearpege/", "/DPPaquetAROME-OM/")
 MAX_COOLDOWN_S = 120.0  # attente la plus longue après des refus de suite : pluie PIAF, radar, DPClim, météo des forêts
 MAX_BULK_COOLDOWN_S = 1800.0  # la même pour les produits en gros (`BULK_PATH_MARKERS`)
+MAX_OUTAGE_COOLDOWN_S = 300.0  # la même pour un produit en gros quand le refus est une panne de Météo-France (`OUTAGE_CODES`)
+# « Synopsis backend error » : le serveur de données de Météo-France, limité par son propre fond, refuse tout le monde (25/11/2026).
+OUTAGE_CODES = frozenset({"868500"})
 LIMIT_HEADER_WORDS = ("ratelimit", "rate-limit", "retry-after", "quota", "throttl")  # en-têtes de limite recopiés au journal
+_FAULT_CODE = re.compile(r"<mw:code>\s*(\d+)\s*</mw:code>")  # le code du serveur de données (`<mw:fault>`)
+_INNER_CODE = re.compile(r"""["']code["']\s*:\s*["']?(\d+)""")  # le code qu'il enveloppe, ou celui de la passerelle du portail
+_NEXT_ACCESS = re.compile(r"""["']nextAccessTime["']\s*:\s*["']([^"']{1,60})""")
 
 
 def is_meteofrance(host: str) -> bool:
@@ -71,6 +84,28 @@ def limit_headers(headers: httpx.Headers) -> str:
     """Les en-têtes de limite d'une réponse (`X-RateLimit-*`, `Retry-After`...), pour le journal ; vide s'il n'y en a pas."""
     found = [f"{name}={value[:80]}" for name, value in headers.items() if any(word in name.lower() for word in LIMIT_HEADER_WORDS)]
     return ", ".join(found)
+
+
+def refusal_codes(body: str) -> tuple[str, ...]:
+    """Les codes d'erreur du corps d'un refus, dans l'ordre : celui du serveur de données (`<mw:code>`), puis ceux qu'il enveloppe.
+
+    Relevé le 25/11/2026 sur PE-AROME : `<mw:fault>` 868500 « Synopsis backend error », description
+    `{"code":"900804","message":"Message throttled out",...,"nextAccessTime":"..."}`. Un refus de notre propre quota viendrait
+    de la passerelle du portail, en JSON, sans `<mw:fault>`.
+    """
+    codes = [*_FAULT_CODE.findall(body), *_INNER_CODE.findall(body)]
+    return tuple(dict.fromkeys(codes))
+
+
+def refusal_summary(body: str) -> str:
+    """Ce que dit le corps d'un refus, en une ligne de journal : panne chez Météo-France ou non, codes, accès annoncé."""
+    codes = refusal_codes(body)
+    if not codes:
+        return "corps sans code d'erreur"
+    text = "panne du serveur de données de Météo-France" if OUTAGE_CODES.intersection(codes) else "codes du refus"
+    text += " " + "/".join(codes)
+    nxt = _NEXT_ACCESS.search(body)
+    return text + (f", accès annoncé après {nxt.group(1)}" if nxt else "")
 
 
 class SharedQuota:
@@ -161,10 +196,11 @@ class SharedQuota:
                 raise
         return seconds
 
-    def refused(self, api: str, retry_after: float | None = None, bulk: bool = False) -> tuple[float, int]:
+    def refused(self, api: str, retry_after: float | None = None, bulk: bool = False, outage: bool = False) -> tuple[float, int]:
         """Un 429 de `api` : la bloque `Retry-After` secondes, sinon 30 s doublées à chaque refus de suite ; rend (attente, refus de suite).
 
-        L'attente est plafonnée à `MAX_COOLDOWN_S`, ou à `MAX_BULK_COOLDOWN_S` pour un produit en gros (`bulk`).
+        L'attente est plafonnée à `MAX_COOLDOWN_S`, ou pour un produit en gros (`bulk`) à `MAX_BULK_COOLDOWN_S`, ou à
+        `MAX_OUTAGE_COOLDOWN_S` quand le refus est une panne de Météo-France (`outage`, lu dans le corps : `OUTAGE_CODES`).
 
         Un 429 qui arrive alors que l'API est déjà bloquée vient d'une requête partie avant le blocage (les autres attendent sa
         fin) : il ne compte pas comme un refus de plus.
@@ -184,7 +220,8 @@ class SharedQuota:
                         (f"strikes:{api}", float(strikes)),
                     )
                 wanted = retry_after if retry_after is not None else self.default_cooldown * 2 ** (strikes - 1)
-                seconds = min(max(wanted, 1.0), MAX_BULK_COOLDOWN_S if bulk else MAX_COOLDOWN_S)
+                cap = (MAX_OUTAGE_COOLDOWN_S if outage else MAX_BULK_COOLDOWN_S) if bulk else MAX_COOLDOWN_S
+                seconds = min(max(wanted, 1.0), cap)
                 self._block_until(api, now + seconds)
                 self._conn.execute("COMMIT")
             except BaseException:
@@ -235,11 +272,16 @@ class SharedQuota:
             if response.status_code == 429:
                 raw = response.headers.get("retry-after", "").strip()
                 bulk = is_bulk(response.request.url.path)
-                seconds, strikes = self.refused(api, float(raw) if raw.isdigit() else None, bulk=bulk)
+                try:  # le corps d'un refus fait quelques centaines d'octets : il dit d'où vient le refus
+                    body = (await response.aread())[:4000].decode("utf-8", "replace")
+                except httpx.HTTPError:
+                    body = ""
+                outage = bool(OUTAGE_CODES.intersection(refusal_codes(body)))
+                seconds, strikes = self.refused(api, float(raw) if raw.isdigit() else None, bulk=bulk, outage=outage)
                 total, mine = self.recent(api)
                 log.warning(
                     "Météo-France : 429 de %s (%d de suite), plus aucune requête vers cette API pendant %.0f s ; "
-                    "%d requêtes parties en %.0f s, dont %d vers elle ; en-têtes de limite : %s (%s)",
+                    "%d requêtes parties en %.0f s, dont %d vers elle ; en-têtes de limite : %s ; %s (%s)",
                     api,
                     strikes,
                     seconds,
@@ -247,6 +289,7 @@ class SharedQuota:
                     self.window,
                     mine,
                     limit_headers(response.headers) or "aucun",
+                    refusal_summary(body),
                     response.request.url.path,
                 )
             elif response.status_code < 400:
