@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Script de préparation d'une VM Oracle Cloud Ubuntu/Debian ARM64 (2 OCPU, 12 Go RAM)
+# Script de préparation d'une VM Oracle Cloud Ubuntu/Debian ARM64 (Ampere A1 : 4 OCPU, 24 Go RAM)
 echo "=== 1. Mise à jour système et installation Docker ==="
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl gnupg ufw
