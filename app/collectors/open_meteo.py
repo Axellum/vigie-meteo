@@ -203,7 +203,7 @@ class OpenMeteoCollector(ResilientCollector):
         return await self.fetch_with_cache(
             cache_key=cache_key,
             url=url,
-            ttl_seconds=self._settings.forecast_ttl_seconds,
+            ttl_seconds=self._settings.proxy_forecast_ttl_seconds,
             params=query_params,
         )
 

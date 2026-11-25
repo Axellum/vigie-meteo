@@ -155,6 +155,8 @@ class Settings(BaseSettings):
 
     # Durées de vie du cache (TTL en secondes) et fenêtre de tolérance "stale"
     forecast_ttl_seconds: int = Field(default=900, alias="METEO_FORECAST_TTL_SECONDS")
+    # `/v1/forecast` (proxy lu par Vigie) : l'Open-Meteo local répond en ~2 ms, inutile de garder 15 min ; la réponse périmée reste servie en panne.
+    proxy_forecast_ttl_seconds: int = Field(default=90, ge=0, alias="METEO_PROXY_FORECAST_TTL_SECONDS")
     nowcast_ttl_seconds: int = Field(default=180, alias="METEO_NOWCAST_TTL_SECONDS")
     max_stale_seconds: int = Field(default=86400, alias="METEO_MAX_STALE_SECONDS")
     # Purge des entrées du cache SQLite plus vieilles que `max_stale_seconds` (elles ne peuvent plus être servies) : toutes les 6 h.
