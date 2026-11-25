@@ -227,7 +227,7 @@ async def test_pe_arome_an_incomplete_run_is_never_served_and_the_retry_skips_wh
 
 
 async def test_pe_arome_a_restart_keeps_the_maps_already_read(tmp_path: Path) -> None:
-    """Le conteneur redémarre en plein téléchargement (25/11/2026 : deux fois pendant une panne de PE-AROME) : rien n'est redemandé."""
+    """Le conteneur redémarre en plein téléchargement (25/11/2026 : deux fois pendant les refus de PE-AROME) : rien n'est redemandé."""
     wcs = FakeAromeWcs()
     wcs.broken = {("storm", 30)}
     first = arome_collector(tmp_path, wcs)

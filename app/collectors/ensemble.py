@@ -21,7 +21,7 @@ Un run incomplet n'est jamais servi.
 
 Chaque carte déjà lue d'un run en cours est gardée sur disque (`partial/<run>/`, un `.npy` de 70 Ko par carte réduite) : un
 redémarrage de la passerelle reprend où il en était au lieu de redemander les 119 (ou 140) cartes. Le 25/11/2026, deux
-redémarrages en pleine panne de PE-AROME (des 429 de leur serveur de données pendant des heures) avaient perdu ce qui était lu.
+redémarrages pendant les refus de PE-AROME (des 429 de leur serveur de données pendant des heures) avaient perdu ce qui était lu.
 """
 
 from __future__ import annotations

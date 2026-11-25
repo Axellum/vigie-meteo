@@ -15,17 +15,19 @@ Ici, une seule comptabilité, partagée par les processus dans un petit fichier 
   en 2 h 30 (35 PE-AROME, puis 8 PE-ARPEGE), sans `Retry-After`, et chacun arrêtait tout 30 s) ;
 - l'attente monte à 120 s au plus pour ce qu'un visiteur attend, à 30 min pour les produits en gros quand on ne sait pas
   d'où vient le refus (un run d'ensemble ne vient que toutes les quelques heures : 30 min de retard au pire ne se voient pas) ;
-- **sauf une panne de Météo-France** : un 429 dont le corps dit `<mw:code>868500</mw:code>` (« Synopsis backend error »)
-  vient de leur serveur de données, lui-même limité par son propre fond (il enveloppe un `900804 Message throttled out`),
-  pour tous les utilisateurs à la fois. Notre quota n'y est pour rien (PE-AROME : palier de 900 requêtes par minute dans la
-  clé, on en fait 12 au plus) et la panne va et vient : le 25/11/2026, PE-AROME a refusé ainsi de 18 h à 21 h 30 UTC passées,
+- **sauf un refus du serveur de données de Météo-France** : un 429 dont le corps dit `<mw:code>868500</mw:code>`
+  (« Synopsis backend error ») vient de leur serveur de données, lui-même limité derrière le portail (il enveloppe un
+  `900804 Message throttled out`). Ce n'est pas le palier de notre clé (PE-AROME : 900 requêtes par minute, on en fait 12
+  au plus) : le 25/11/2026 de 21 h 21 à 21 h 42 UTC, une seule requête toutes les 5 min était encore refusée, accès annoncé
+  à la minute suivante. Une limite commune à tous les utilisateurs est probable, pas prouvée (un plafond propre à notre
+  compte, caché derrière le portail, n'est pas exclu). Le refus va et vient : le 25/11/2026, PE-AROME a refusé ainsi de 18 h à 21 h 30 UTC passées,
   mais répondait à 20 h 06 UTC, entre deux essais de 19 h 53 et 20 h 23 que l'attente de 30 min rendait aveugles. Après
   ce refus-là, l'attente monte à 5 min au plus (`MAX_OUTAGE_COOLDOWN_S`) : une requête toutes les 5 min ne pèse rien chez eux
   et attrape les moments où le service répond.
 
 Chaque 429 est écrit au journal avec le nombre de requêtes parties dans la fenêtre (toutes, et vers cette API), les en-têtes
 de limite du portail s'il en donne et les codes d'erreur lus dans le corps du refus (`refusal_codes`) : de quoi distinguer
-notre quota d'une panne chez eux sans relancer une enquête.
+notre quota d'un refus de leur serveur de données sans relancer une enquête.
 
 Choix du fichier SQLite plutôt qu'un verrou de fichier : le dépôt a déjà SQLite (WAL), il marche sous Windows comme sous Linux
 (les tests s'y lancent), et `BEGIN IMMEDIATE` donne l'exclusion entre processus et la lecture-puis-écriture du compteur d'un seul
@@ -57,8 +59,8 @@ HOST_SUFFIX = "meteofrance.fr"
 BULK_PATH_MARKERS = ("/aromepi/", "/pearome/", "/pearpege/", "/DPPaquetAROME-OM/")
 MAX_COOLDOWN_S = 120.0  # attente la plus longue après des refus de suite : pluie PIAF, radar, DPClim, météo des forêts
 MAX_BULK_COOLDOWN_S = 1800.0  # la même pour les produits en gros (`BULK_PATH_MARKERS`)
-MAX_OUTAGE_COOLDOWN_S = 300.0  # la même pour un produit en gros quand le refus est une panne de Météo-France (`OUTAGE_CODES`)
-# « Synopsis backend error » : le serveur de données de Météo-France, limité par son propre fond, refuse tout le monde (25/11/2026).
+MAX_OUTAGE_COOLDOWN_S = 300.0  # la même pour un produit en gros refusé par le serveur de données (`OUTAGE_CODES`)
+# « Synopsis backend error » : le serveur de données de Météo-France, limité derrière le portail (25/11/2026).
 OUTAGE_CODES = frozenset({"868500"})
 LIMIT_HEADER_WORDS = ("ratelimit", "rate-limit", "retry-after", "quota", "throttl")  # en-têtes de limite recopiés au journal
 _FAULT_CODE = re.compile(r"<mw:code>\s*(\d+)\s*</mw:code>")  # le code du serveur de données (`<mw:fault>`)
@@ -98,7 +100,7 @@ def refusal_codes(body: str) -> tuple[str, ...]:
 
 
 def refusal_summary(body: str) -> str:
-    """Ce que dit le corps d'un refus, en une ligne de journal : panne chez Météo-France ou non, codes, accès annoncé."""
+    """Ce que dit le corps d'un refus, en une ligne de journal : refus du serveur de données ou non, codes, accès annoncé."""
     codes = refusal_codes(body)
     if not codes:
         return "corps sans code d'erreur"
@@ -200,7 +202,7 @@ class SharedQuota:
         """Un 429 de `api` : la bloque `Retry-After` secondes, sinon 30 s doublées à chaque refus de suite ; rend (attente, refus de suite).
 
         L'attente est plafonnée à `MAX_COOLDOWN_S`, ou pour un produit en gros (`bulk`) à `MAX_BULK_COOLDOWN_S`, ou à
-        `MAX_OUTAGE_COOLDOWN_S` quand le refus est une panne de Météo-France (`outage`, lu dans le corps : `OUTAGE_CODES`).
+        `MAX_OUTAGE_COOLDOWN_S` quand le refus vient du serveur de données de Météo-France (`outage`, lu dans le corps : `OUTAGE_CODES`).
 
         Un 429 qui arrive alors que l'API est déjà bloquée vient d'une requête partie avant le blocage (les autres attendent sa
         fin) : il ne compte pas comme un refus de plus.

@@ -173,7 +173,7 @@ async def test_what_a_visitor_waits_for_is_asked_again_within_two_minutes(tmp_pa
 
 
 # Le corps d'un refus de PE-AROME relevé le 25/11/2026 à 20 h 23 UTC (en-têtes sans aucune limite) : leur serveur de données
-# (« Synopsis ») se fait limiter par son propre fond et refuse tout le monde ; notre clé a 900 requêtes par minute sur PE-AROME.
+# (« Synopsis ») est limité derrière le portail ; notre clé a 900 requêtes par minute sur PE-AROME, on en fait 12 au plus.
 OUTAGE_BODY = (
     '<?xml version="1.0" encoding="UTF-8"?><mw:fault xmlns:mw="http://metwork-framework.org/"><mw:code>868500</mw:code>'
     "<mw:message>Synopsis backend error</mw:message><mw:description>b'{\"code\":\"900804\",\"message\":\"Message throttled out\","
@@ -195,7 +195,7 @@ def test_the_body_of_a_refusal_says_whether_meteo_france_is_down() -> None:
 async def test_an_outage_of_meteo_france_is_asked_again_within_five_minutes_and_logged(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Une prévision d'ensemble refusée par la panne de leur serveur : 5 min au plus entre deux essais, pas 30 min."""
+    """Une prévision d'ensemble refusée par leur serveur de données : 5 min au plus entre deux essais, pas 30 min."""
     clock = Clock()
     quota = quota_on(tmp_path, clock)
     answers = [httpx.Response(429, text=OUTAGE_BODY) for _ in range(7)] + [httpx.Response(200)]
