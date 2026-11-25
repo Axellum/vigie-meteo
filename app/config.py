@@ -141,6 +141,15 @@ class Settings(BaseSettings):
         default=360, ge=30, le=1440, alias="METEO_FORESTS_OFF_SEASON_POLL_MINUTES"
     )
 
+    # Quota du portail Météo-France : 50 requêtes par minute pour la clé, tous produits et tous processus confondus (voir `app/quota.py`).
+    # 45 = une marge de 5 ; 0 coupe le limiteur. `reserve` places de la fenêtre restent aux produits qu'un visiteur attend (PIAF, radar,
+    # DPClim, forêts) : les produits « en gros » (ensemble, AROME-PI, AROME-OM) n'en prennent que `limit - reserve`.
+    meteofrance_quota_per_minute: int = Field(default=45, ge=0, le=50, alias="METEOFRANCE_QUOTA_PER_MINUTE")
+    meteofrance_quota_reserve: int = Field(default=15, ge=0, le=40, alias="METEOFRANCE_QUOTA_RESERVE")
+    meteofrance_quota_min_gap_ms: int = Field(default=250, ge=0, le=5000, alias="METEOFRANCE_QUOTA_MIN_GAP_MS")
+    # Le fichier partagé par les deux processus (défaut : `meteofrance_quota.db` à côté de la base SQLite).
+    meteofrance_quota_path: str | None = Field(default=None, alias="METEOFRANCE_QUOTA_PATH")
+
     # Cache mémoire des tuiles PNG (radar et PIAF) : borne en Mo, PAR PROCESSUS (la passerelle en lance deux). 0 = coupé.
     tile_cache_mb: int = Field(default=32, ge=0, le=512, alias="METEO_TILE_CACHE_MB")
 
