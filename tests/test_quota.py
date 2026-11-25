@@ -19,7 +19,7 @@ import pytest
 
 from app.config import Settings
 from app.main import make_http_client
-from app.quota import SharedQuota, api_of, is_bulk, is_meteofrance, limit_headers
+from app.quota import SharedQuota, api_of, is_bulk, is_meteofrance, limit_headers, refusal_codes, refusal_summary
 
 PORTAL = "https://public-api.meteofrance.fr/public/DPRadar/v1/mosaiques/METROPOLE/observations/LAME_D_EAU"
 PIAF = "https://public-api.meteofrance.fr/pro/piaf/1.0/wcs/X/GetCoverage"
@@ -170,6 +170,67 @@ async def test_what_a_visitor_waits_for_is_asked_again_within_two_minutes(tmp_pa
         for _ in range(6):
             await client.get(PIAF)
     assert [round(b - a) for a, b in zip(sent_at, sent_at[1:], strict=False)] == [30, 60, 120, 120, 120]
+
+
+# Le corps d'un refus de PE-AROME relevé le 25/11/2026 à 20 h 23 UTC (en-têtes sans aucune limite) : leur serveur de données
+# (« Synopsis ») se fait limiter par son propre fond et refuse tout le monde ; notre clé a 900 requêtes par minute sur PE-AROME.
+OUTAGE_BODY = (
+    '<?xml version="1.0" encoding="UTF-8"?><mw:fault xmlns:mw="http://metwork-framework.org/"><mw:code>868500</mw:code>'
+    "<mw:message>Synopsis backend error</mw:message><mw:description>b'{\"code\":\"900804\",\"message\":\"Message throttled out\","
+    '"description":"You have exceeded your quota .You can access API after 2026-nov.-25 20:24:00+0000 UTC",'
+    "\"nextAccessTime\":\"2026-nov.-25 20:24:00+0000 UTC\"}'</mw:description></mw:fault>"
+)
+
+
+def test_the_body_of_a_refusal_says_whether_meteo_france_is_down() -> None:
+    assert refusal_codes(OUTAGE_BODY) == ("868500", "900804")
+    assert refusal_summary(OUTAGE_BODY) == (
+        "panne du serveur de données de Météo-France 868500/900804, accès annoncé après 2026-nov.-25 20:24:00+0000 UTC"
+    )
+    own = '{"code":"900802","message":"Message throttled out","description":"You have exceeded your quota"}'
+    assert refusal_codes(own) == ("900802",) and refusal_summary(own) == "codes du refus 900802"
+    assert refusal_codes("") == () and refusal_summary("") == "corps sans code d'erreur"
+
+
+async def test_an_outage_of_meteo_france_is_asked_again_within_five_minutes_and_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Une prévision d'ensemble refusée par la panne de leur serveur : 5 min au plus entre deux essais, pas 30 min."""
+    clock = Clock()
+    quota = quota_on(tmp_path, clock)
+    answers = [httpx.Response(429, text=OUTAGE_BODY) for _ in range(7)] + [httpx.Response(200)]
+    sent_at: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent_at.append(clock.now)
+        return answers.pop(0)
+
+    async with make_client(quota, handler) as client:
+        with caplog.at_level(logging.WARNING, logger="app.quota"):
+            for _ in range(8):
+                await client.get(PEAROME)
+    assert [round(b - a) for a, b in zip(sent_at, sent_at[1:], strict=False)] == [30, 60, 120, 240, 300, 300, 300]
+    message = caplog.records[-1].getMessage()
+    assert "429 de pearome (7 de suite)" in message and "pendant 300 s" in message
+    assert "panne du serveur de données de Météo-France 868500/900804" in message
+
+
+async def test_an_unexplained_refusal_of_a_bulk_product_still_waits_up_to_thirty_minutes(tmp_path: Path) -> None:
+    """Un refus sans `<mw:fault>` (notre quota, ou on ne sait pas) : le plafond de 30 min des produits en gros reste."""
+    clock = Clock()
+    quota = quota_on(tmp_path, clock)
+    own = '{"code":"900802","message":"Message throttled out"}'
+    answers = [httpx.Response(429, text=own) for _ in range(8)] + [httpx.Response(200)]
+    sent_at: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent_at.append(clock.now)
+        return answers.pop(0)
+
+    async with make_client(quota, handler) as client:
+        for _ in range(9):
+            await client.get(PEAROME)
+    assert [round(b - a) for a, b in zip(sent_at, sent_at[1:], strict=False)] == [30, 60, 120, 240, 480, 960, 1800, 1800]
 
 
 async def test_refusals_of_requests_already_sent_count_once(tmp_path: Path) -> None:
