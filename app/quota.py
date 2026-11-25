@@ -12,7 +12,7 @@ Ici, une seule comptabilité, partagée par les processus dans un petit fichier 
 - après un 429, plus aucune requête ne part **vers la même API** (`/public/pearome/...` : `pearome`) avant la fin du délai
   demandé (`Retry-After`, sinon 30 s doublées à chaque refus de suite, 120 s au plus) : tous les processus attendent, personne
   ne reboucle sur un refus, et la pluie PIAF ou le radar ne paient pas le refus d'une prévision d'ensemble (vu le 25/11/2026 :
-  47 refus en 2 h 30, tous PE-AROME ou PE-ARPEGE, sans `Retry-After`, et chacun arrêtait tout 30 s).
+  43 refus en 2 h 30 (35 PE-AROME, puis 8 PE-ARPEGE), sans `Retry-After`, et chacun arrêtait tout 30 s).
 
 Chaque 429 est écrit au journal avec le nombre de requêtes parties dans la fenêtre (toutes, et vers cette API) et les en-têtes
 de limite du portail s'il en donne : de quoi trouver la vraie limite d'une API.
