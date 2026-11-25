@@ -68,6 +68,13 @@ class RadarStore:
                 found.append(int(entry.stem))
         return sorted(found)
 
+    def stamp(self, epoch: int) -> int | None:
+        """Date d'écriture (ns) du fichier d'une image, ou None s'il n'existe plus : fait partie de la clé du cache des tuiles."""
+        try:
+            return self._path(epoch).stat().st_mtime_ns
+        except OSError:
+            return None
+
     def save(self, frame: RadarFrame) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         target = self._path(frame.epoch)

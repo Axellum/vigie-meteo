@@ -13,6 +13,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+PRAGMAS = (
+    "busy_timeout=5000",
+    "cache_size=-16384",
+    "mmap_size=268435456",
+    "temp_store=MEMORY",
+)
+
 
 class CacheStore:
     """Stockage clé/valeur JSON + état des circuit breakers sur SQLite WAL."""
@@ -30,6 +37,10 @@ class CacheStore:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA synchronous=NORMAL;")
+            # Réglages par connexion (donc par processus) : 16 Mo de cache de pages, fichier projeté en mémoire jusqu'à 256 Mo
+            # (une réponse « hourly » pèse ~145 Ko), tris et index temporaires en mémoire, attente d'un verrou tenu par l'autre processus.
+            for pragma in PRAGMAS:
+                self._conn.execute(f"PRAGMA {pragma};")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS cache_entries (

@@ -78,9 +78,11 @@ from app.models import (
     UnifiedWeatherResponse,
 )
 from app.piaf_grid import grid_bounds, piaf_tile_png
+from app.quota import SharedQuota
 from app.radar_grid import AREAS, MAX_ZOOM, METROPOLE, MIN_ZOOM, legend, tile_png
 from app.security import ApiKeyMiddleware
 from app.services.weather import WeatherAggregatorService
+from app.tile_cache import TileCache, piaf_key, radar_key
 
 log = logging.getLogger(__name__)
 
@@ -102,6 +104,22 @@ async def purge_cache_forever(cache: CacheStore, cfg: Settings) -> None:
         await asyncio.sleep(cfg.cache_purge_interval_seconds)
 
 
+def make_http_client(cfg: Settings) -> tuple[httpx.AsyncClient, SharedQuota | None]:
+    """Le client HTTP de la passerelle : chaque requête vers le portail Météo-France passe par le limiteur de quota commun aux deux processus."""
+    if cfg.meteofrance_quota_per_minute <= 0:
+        return httpx.AsyncClient(), None
+    path = cfg.meteofrance_quota_path or str(Path(cfg.db_path).resolve().parent / "meteofrance_quota.db")
+    if cfg.db_path == ":memory:" and not cfg.meteofrance_quota_path:
+        path = ":memory:"
+    quota = SharedQuota(
+        path,
+        limit=cfg.meteofrance_quota_per_minute,
+        reserve=cfg.meteofrance_quota_reserve,
+        min_gap=cfg.meteofrance_quota_min_gap_ms / 1000.0,
+    )
+    return httpx.AsyncClient(event_hooks=quota.event_hooks()), quota
+
+
 def create_app(
     settings: Settings | None = None,
     http_client: httpx.AsyncClient | None = None,
@@ -113,13 +131,18 @@ def create_app(
     async def lifespan(app_instance: FastAPI):
         cache = CacheStore(cfg.db_path)
         own_client = http_client is None
-        client = http_client or httpx.AsyncClient()
+        quota: SharedQuota | None = None
+        if http_client is None:
+            client, quota = make_http_client(cfg)
+        else:
+            client = http_client
 
         om_collector = OpenMeteoCollector(client, cache, cfg)
         now_collector = MeteoFranceNowcastCollector(client, cache, cfg)
         service = WeatherAggregatorService(om_collector, now_collector)
 
         app_instance.state.settings = cfg
+        app_instance.state.tile_cache = TileCache(cfg.tile_cache_mb * 1024 * 1024)
         app_instance.state.cache = cache
         app_instance.state.om_collector = om_collector
         app_instance.state.now_collector = now_collector
@@ -192,6 +215,8 @@ def create_app(
             cache.close()
             if own_client:
                 await client.aclose()
+            if quota is not None:
+                quota.close()
 
     app = FastAPI(
         title="Météo-France Unified API",
@@ -457,8 +482,13 @@ def create_app(
         grid = piaf.step_for_epoch(epoch)
         if grid is None:
             raise HTTPException(status_code=404, detail="Échéance PIAF inconnue dans le run courant.")
-        png = await run_in_threadpool(piaf_tile_png, grid, z, x, y)
         drawn = int(piaf.run.timestamp())
+        tile_cache: TileCache = request.app.state.tile_cache
+        key = piaf_key(drawn, epoch, PIAF_STEP_SECONDS, z, x, y)
+        png = tile_cache.get(key)
+        if png is None:
+            png = await run_in_threadpool(piaf_tile_png, grid, z, x, y)
+            tile_cache.put(key, png)
         return Response(
             content=png,
             media_type="image/png",
@@ -674,10 +704,17 @@ def create_app(
         radar = radar_of(request, slug)
         if not (0 <= z <= MAX_ZOOM) or not (0 <= x < 2**z) or not (0 <= y < 2**z):
             raise HTTPException(status_code=404, detail="Tuile hors de la carte.")
-        frame = await run_in_threadpool(radar.store.load, epoch)
-        if frame is None:
-            raise HTTPException(status_code=404, detail="Image radar inconnue ou déjà purgée.")
-        png = await run_in_threadpool(tile_png, frame, z, x, y)
+        tile_cache: TileCache = request.app.state.tile_cache
+        stamp = radar.store.stamp(epoch)
+        key = radar_key(radar.area.slug, epoch, stamp, z, x, y) if stamp is not None else None
+        png = tile_cache.get(key) if key is not None else None
+        if png is None:
+            frame = await run_in_threadpool(radar.store.load, epoch)
+            if frame is None:
+                raise HTTPException(status_code=404, detail="Image radar inconnue ou déjà purgée.")
+            png = await run_in_threadpool(tile_png, frame, z, x, y)
+            if key is not None:
+                tile_cache.put(key, png)
         return Response(content=png, media_type="image/png", headers={"Cache-Control": "public, max-age=86400, immutable"})
 
     @app.get("/v1/radar/frames", response_model=RadarFramesResponse, tags=["Radar"])

@@ -1,6 +1,6 @@
 # Météo-France Unified API
 
-API météo résiliente et standardisée pour la France, conçue pour tourner sur **Oracle Cloud Always Free** (2 OCPU ARM64 / 12 Go RAM).
+API météo résiliente et standardisée pour la France, conçue pour tourner sur une VM **Oracle Cloud Ampere A1** (4 cœurs ARM64 / 24 Go de RAM depuis le 18/11/2026).
 
 Elle remplace et fiabilise l'API officielle Météo-France en combinant :
 1. **Open-Meteo auto-hébergé (France uniquement)** : modèles **AROME HD** (~1,5 km, 0–48 h) et **ARPEGE Europe** (~11 km, J+2 à J+4) fusionnés en une seule série horaire continue.
@@ -37,7 +37,7 @@ C'est la source météo interne de [Vigie](https://github.com/Axellum/vigie-api)
 
 ### Cache SQLite : appels partagés et purge
 
-Les prévisions Open-Meteo passent par un cache SQLite (`app/cache.py`, durée de vie `METEO_FORECAST_TTL_SECONDS`, entrées périmées servies en panne jusqu'à `METEO_MAX_STALE_SECONDS`, 24 h par défaut). Quand plusieurs requêtes arrivent en même temps sur une clé froide ou périmée, **un seul appel part vers la source** (par clé et adresse) : les autres attendent sa réponse, et une panne n'est comptée qu'une fois par le disjoncteur. Une tâche de fond supprime toutes les 6 h (`METEO_CACHE_PURGE_INTERVAL_SECONDS`) les entrées plus vieilles que `METEO_MAX_STALE_SECONDS`, que plus rien ne peut servir ; les relevés DPClim et la météo des forêts, qui ont leur propre renouvellement, sont conservés.
+Les prévisions Open-Meteo passent par un cache SQLite (`app/cache.py`, durée de vie `METEO_FORECAST_TTL_SECONDS`, 15 minutes par défaut, et `METEO_PROXY_FORECAST_TTL_SECONDS` pour `/v1/forecast` seulement, 90 secondes par défaut : l'Open-Meteo local répond en quelques millisecondes, inutile de garder plus longtemps ; entrées périmées servies en panne jusqu'à `METEO_MAX_STALE_SECONDS`, 24 h par défaut). Quand plusieurs requêtes arrivent en même temps sur une clé froide ou périmée, **un seul appel part vers la source** (par clé et adresse) : les autres attendent sa réponse, et une panne n'est comptée qu'une fois par le disjoncteur. Une tâche de fond supprime toutes les 6 h (`METEO_CACHE_PURGE_INTERVAL_SECONDS`) les entrées plus vieilles que `METEO_MAX_STALE_SECONDS`, que plus rien ne peut servir ; les relevés DPClim et la météo des forêts, qui ont leur propre renouvellement, sont conservés.
 
 ### Radar (lame d'eau)
 
@@ -96,6 +96,40 @@ Source : Météo-France, modèle AROME Outre-mer, Licence Ouverte Etalab 2.0 (do
 `DPMeteoForets/v1` : le fichier `carte/encours` (CSV des 96 départements) n'existe que de juin à septembre ; hors saison le portail répond 404, la route répond `out_of_season` et la santé reste « fresh » (contrôle toutes les 6 h, toutes les 30 min en saison). Le format est celui de l'échantillon publié par Météo-France sur data.gouv.fr (22/05/2024) : **le fichier servi aujourd'hui n'a pas pu être lu hors saison**. `METEO_FORESTS_ENABLED=0` coupe la tâche.
 Source : Météo-France, données climatologiques de base et Météo des forêts, Licence Ouverte Etalab 2.0 (document de licence de chaque API sur le portail, lu le 18/11/2026).
 
+### Quota du portail Météo-France : un limiteur commun
+
+La clé a **50 requêtes par minute**, pour tous les produits ensemble, alors que la somme des plafonds propres à chaque collecteur
+(`METEO_*_REQUESTS_PER_MINUTE`) la dépasse déjà et que chacun des deux processus compte de son côté. `app/quota.py` ajoute une comptabilité
+commune, dans un petit fichier SQLite (`meteofrance_quota.db`, à côté de la base du cache) lu et écrit sous `BEGIN IMMEDIATE`, branchée en
+crochet httpx sur toute requête vers `meteofrance.fr` (les rythmes propres à chaque collecteur restent : ils règlent le partage, le limiteur garantit la somme) :
+
+- fenêtre glissante de **45 requêtes sur 60 s** (une marge de 5 sous le quota) ;
+- les produits « en gros » (prévisions d'ensemble, AROME-PI, AROME-OM) ne prennent que 30 de ces places : 15 restent à la pluie PIAF, au radar, à DPClim et aux forêts ;
+- au moins 0,25 s entre deux requêtes : le premier tour au démarrage s'étale au lieu de partir en rafale ;
+- un **429** bloque toutes les requêtes des deux processus pendant le `Retry-After` du portail (30 s sans lui, 120 s au plus) : on attend, on ne reboucle pas.
+
+Le fichier survit à un redémarrage du conteneur (le quota déjà consommé reste compté). Le limiteur ne voit pas un autre programme qui utiliserait la même clé : c'est la raison de la marge.
+
+### Cache mémoire des tuiles (radar et PIAF)
+
+Les tuiles PNG ne sont plus redessinées à chaque requête : `app/tile_cache.py` garde les dernières en mémoire (LRU, **borné en octets**, `METEO_TILE_CACHE_MB`).
+Chacun des deux processus a le sien : la mémoire prise est au plus le double de la borne. La clé contient tout ce qui détermine l'image (produit ou zone,
+run PIAF ou date du fichier radar, fin de cumul, pas, z/x/y, style) : un nouveau run ou une nouvelle image radar ne resert jamais une ancienne tuile. Les en-têtes de cache HTTP ne changent pas.
+
+### Réglages de la passerelle (variables d'environnement)
+
+| Variable | Défaut | Rôle |
+| :--- | :--- | :--- |
+| `METEO_TILE_CACHE_MB` | `32` | Cache des tuiles, en Mo **par processus** (2 processus) ; `0` le coupe |
+| `METEOFRANCE_QUOTA_PER_MINUTE` | `45` | Requêtes par minute vers le portail Météo-France, tous produits et processus ; `0` coupe le limiteur |
+| `METEOFRANCE_QUOTA_RESERVE` | `15` | Places gardées à PIAF, au radar, à DPClim et aux forêts (les produits « en gros » n'ont que `limite - réserve`) |
+| `METEOFRANCE_QUOTA_MIN_GAP_MS` | `250` | Écart minimal entre deux requêtes vers le portail |
+| `METEOFRANCE_QUOTA_PATH` | `meteofrance_quota.db` à côté de la base | Fichier du quota partagé |
+| `METEO_PROXY_FORECAST_TTL_SECONDS` | `90` | Durée du cache de `/v1/forecast` |
+| `METEO_PIAF_STEPS` | `12` dans le code, **18 en service** | Échéances PIAF lues par run (pas de 5 min : 12 = +1 h, 18 = +1 h 30) ; le service le fixe à 18 (environnement du déploiement) |
+
+Le défaut du code (12) n'est pas changé : le service tourne avec `METEO_PIAF_STEPS=18`, ce qui fait 18 cartes téléchargées par run PIAF au lieu de 12.
+
 ## Développement & Tests locaux (Windows PowerShell)
 
 ```powershell
@@ -104,7 +138,7 @@ Source : Météo-France, données climatologiques de base et Météo des forêts
 .venv\Scripts\uvicorn.exe app.main:app --reload --port 8000
 ```
 
-## Déploiement sur Oracle Cloud (2 OCPU ARM64 / 12 Go RAM)
+## Déploiement sur Oracle Cloud (Ampere A1 : 4 cœurs ARM64 / 24 Go de RAM)
 
 1. Ouvrir les ports `80` et `443` dans la *Security List* OCI.
 2. Sur la VM Ubuntu/Debian ARM64 :

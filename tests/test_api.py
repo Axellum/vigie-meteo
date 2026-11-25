@@ -294,7 +294,7 @@ def test_proxy_forecast_says_whether_the_answer_is_fresh_or_stale(tmp_path: Path
 
         # Open-Meteo goes down and the cached answer expires: the proxy still answers, and says so.
         state["up"] = False
-        client.app.state.settings.forecast_ttl_seconds = 0
+        client.app.state.settings.proxy_forecast_ttl_seconds = 0
         stale = client.get("/v1/forecast", params=params)
         assert stale.status_code == 200 and stale.headers["x-cache-status"] == "stale"
         assert stale.json() == first.json()
