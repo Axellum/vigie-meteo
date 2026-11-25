@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import logging
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -17,9 +19,11 @@ import pytest
 
 from app.config import Settings
 from app.main import make_http_client
-from app.quota import SharedQuota, is_bulk, is_meteofrance
+from app.quota import SharedQuota, api_of, is_bulk, is_meteofrance, limit_headers
 
 PORTAL = "https://public-api.meteofrance.fr/public/DPRadar/v1/mosaiques/METROPOLE/observations/LAME_D_EAU"
+PIAF = "https://public-api.meteofrance.fr/pro/piaf/1.0/wcs/X/GetCoverage"
+PEAROME = "https://public-api.meteofrance.fr/public/pearome/1.0/wcs/MF-NWP-HIGHRES-PEAROME-0025-FRANCE-WCS/GetCoverage"
 
 
 class Clock:
@@ -92,6 +96,14 @@ def test_which_requests_are_counted_and_which_are_bulk() -> None:
     assert not is_bulk("/pro/piaf/1.0/wcs/X/GetCoverage") and not is_bulk("/public/DPRadar/v1/mosaiques")
 
 
+def test_the_api_of_a_request_is_the_segment_after_the_access() -> None:
+    assert api_of("/public/pearome/1.0/wcs/X/GetCoverage") == "pearome"
+    assert api_of("/pro/piaf/1.0/wcs/X/GetCoverage") == "piaf"
+    assert api_of("/previnum/DPPaquetAROME-OM/v1/models") == "DPPaquetAROME-OM"
+    assert api_of("/public/DPRadar/v1/mosaiques") == "DPRadar"
+    assert api_of("/token") == "token" and api_of("/") == ""
+
+
 # ------------------------------------------------------------------------------------------------ un 429
 
 
@@ -99,10 +111,11 @@ def make_client(quota: SharedQuota, handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), event_hooks=quota.event_hooks())
 
 
-async def test_a_429_makes_every_later_request_wait_for_the_delay(tmp_path: Path) -> None:
+async def test_a_429_makes_the_same_api_wait_for_the_delay_and_lets_the_others_go(tmp_path: Path) -> None:
+    """Vu le 25/11/2026 : chaque refus d'une prévision d'ensemble arrêtait aussi la pluie PIAF et le radar pendant 30 s."""
     clock = Clock()
     quota = quota_on(tmp_path, clock)
-    answers = [httpx.Response(429, headers={"Retry-After": "20"}), httpx.Response(200), httpx.Response(200)]
+    answers = [httpx.Response(429, headers={"Retry-After": "20"}), httpx.Response(200), httpx.Response(200), httpx.Response(200)]
     sent_at: list[float] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -110,16 +123,84 @@ async def test_a_429_makes_every_later_request_wait_for_the_delay(tmp_path: Path
         return answers.pop(0)
 
     async with make_client(quota, handler) as client:
-        first = await client.get(PORTAL)
+        first = await client.get(PEAROME)
         assert first.status_code == 429
         t0 = clock.now
-        # Un autre produit, tout de suite après : il attend la fin du délai au lieu de repartir
-        second = await client.get("https://public-api.meteofrance.fr/pro/piaf/1.0/wcs/X/GetCoverage")
-        assert second.status_code == 200 and sent_at[1] - t0 == pytest.approx(20.0, abs=0.01)
+        # Une autre API, tout de suite après : elle part sans attendre
+        assert (await client.get(PIAF)).status_code == 200 and sent_at[1] - t0 < 1.0
+        # La même API attend la fin du délai au lieu de repartir
+        assert (await client.get(PEAROME)).status_code == 200 and sent_at[2] - t0 == pytest.approx(20.0, abs=0.01)
         # Et la requête suivante repart normalement
-        await client.get(PORTAL)
-        assert sent_at[2] - sent_at[1] < 1.0
+        await client.get(PEAROME)
+        assert sent_at[3] - sent_at[2] < 1.0
     assert sum(clock.slept) == pytest.approx(20.0, abs=0.01)  # attendu une fois, pas de boucle de petites attentes
+
+
+async def test_refusals_in_a_row_without_retry_after_wait_twice_as_long_each_time_until_an_answer(tmp_path: Path) -> None:
+    clock = Clock()
+    quota = quota_on(tmp_path, clock)
+    answers = [httpx.Response(429), httpx.Response(429), httpx.Response(429), httpx.Response(429), httpx.Response(200), httpx.Response(429)]
+    sent_at: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent_at.append(clock.now)
+        return answers.pop(0)
+
+    async with make_client(quota, handler) as client:
+        for _ in range(6):
+            await client.get(PEAROME)
+    gaps = [round(b - a) for a, b in zip(sent_at, sent_at[1:], strict=False)]
+    assert gaps == [30, 60, 120, 120, 0]  # 30 s, puis le double, 120 s au plus ; une réponse acceptée remet le compte à zéro
+    assert quota.try_acquire(api="pearome") == pytest.approx(30.0)  # le dernier refus est le premier d'une série : 30 s
+
+
+async def test_refusals_of_requests_already_sent_count_once(tmp_path: Path) -> None:
+    """Plusieurs requêtes parties avant le blocage reviennent toutes en 429 : un seul refus, pas une attente qui double à chacune."""
+    clock = Clock()
+    quota = quota_on(tmp_path, clock)
+    assert quota.refused("pearome") == (30.0, 1)
+    clock.now += 2.0
+    assert quota.refused("pearome") == (30.0, 1)  # même compte : 30 s depuis ce refus-ci, pas 60
+    assert quota.try_acquire(api="pearome") == pytest.approx(30.0)
+    assert quota.try_acquire(api="piaf") == 0.0
+
+
+async def test_a_429_is_logged_with_what_was_sent_in_the_window_and_the_limit_headers(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    clock = Clock()
+    quota = quota_on(tmp_path, clock)
+    answers = [httpx.Response(200) for _ in range(3)] + [httpx.Response(429, headers={"X-RateLimit-Remaining": "0", "Server": "x"})]
+
+    async with make_client(quota, lambda r: answers.pop(0)) as client:
+        await client.get(PIAF)
+        await client.get(PEAROME)
+        await client.get(PEAROME)
+        with caplog.at_level(logging.WARNING, logger="app.quota"):
+            await client.get(PEAROME)
+    message = caplog.records[-1].getMessage()
+    assert "429 de pearome (1 de suite)" in message and "30 s" in message
+    assert "4 requêtes parties en 60 s, dont 3 vers elle" in message
+    assert "x-ratelimit-remaining=0" in message.lower() and "server" not in message.lower()
+    assert limit_headers(httpx.Headers({"Content-Type": "text/xml"})) == ""
+
+
+def test_a_file_of_the_global_limiter_is_taken_over(tmp_path: Path) -> None:
+    """Le fichier d'avant (places sans API, blocage commun) : la colonne est ajoutée, ses places comptent toujours."""
+    path = tmp_path / "quota.db"
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE grants (ts REAL NOT NULL)")
+    old.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value REAL NOT NULL)")
+    clock = Clock()
+    old.executemany("INSERT INTO grants (ts) VALUES (?)", [(clock.now - 1.0,)] * 3)
+    old.execute("INSERT INTO state (key, value) VALUES ('blocked_until', ?)", (clock.now + 50.0,))
+    old.commit()
+    old.close()
+    quota = SharedQuota(str(path), limit=4, reserve=0, min_gap=0.0, jitter=0.0, clock=clock, sleep=clock.sleep)
+    assert quota.try_acquire(api="piaf") == 0.0  # le vieux blocage commun ne bloque plus rien
+    assert quota.try_acquire(api="piaf") > 0.0  # les 3 places d'avant comptent : 4 de prises
+    assert quota.recent("piaf") == (4, 1)
+    again = SharedQuota(str(path), clock=clock, sleep=clock.sleep)  # le second processus rouvre le fichier déjà repris
+    again.close()
+    quota.close()
 
 
 async def test_a_429_without_retry_after_waits_the_default_and_a_huge_one_is_capped(tmp_path: Path) -> None:
