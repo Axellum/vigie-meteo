@@ -141,6 +141,9 @@ class Settings(BaseSettings):
         default=360, ge=30, le=1440, alias="METEO_FORESTS_OFF_SEASON_POLL_MINUTES"
     )
 
+    # Cache mémoire des tuiles PNG (radar et PIAF) : borne en Mo, PAR PROCESSUS (la passerelle en lance deux). 0 = coupé.
+    tile_cache_mb: int = Field(default=32, ge=0, le=512, alias="METEO_TILE_CACHE_MB")
+
     # Durées de vie du cache (TTL en secondes) et fenêtre de tolérance "stale"
     forecast_ttl_seconds: int = Field(default=900, alias="METEO_FORECAST_TTL_SECONDS")
     nowcast_ttl_seconds: int = Field(default=180, alias="METEO_NOWCAST_TTL_SECONDS")

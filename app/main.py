@@ -81,6 +81,7 @@ from app.piaf_grid import grid_bounds, piaf_tile_png
 from app.radar_grid import AREAS, MAX_ZOOM, METROPOLE, MIN_ZOOM, legend, tile_png
 from app.security import ApiKeyMiddleware
 from app.services.weather import WeatherAggregatorService
+from app.tile_cache import TileCache, piaf_key, radar_key
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +121,7 @@ def create_app(
         service = WeatherAggregatorService(om_collector, now_collector)
 
         app_instance.state.settings = cfg
+        app_instance.state.tile_cache = TileCache(cfg.tile_cache_mb * 1024 * 1024)
         app_instance.state.cache = cache
         app_instance.state.om_collector = om_collector
         app_instance.state.now_collector = now_collector
@@ -457,8 +459,13 @@ def create_app(
         grid = piaf.step_for_epoch(epoch)
         if grid is None:
             raise HTTPException(status_code=404, detail="Échéance PIAF inconnue dans le run courant.")
-        png = await run_in_threadpool(piaf_tile_png, grid, z, x, y)
         drawn = int(piaf.run.timestamp())
+        tile_cache: TileCache = request.app.state.tile_cache
+        key = piaf_key(drawn, epoch, PIAF_STEP_SECONDS, z, x, y)
+        png = tile_cache.get(key)
+        if png is None:
+            png = await run_in_threadpool(piaf_tile_png, grid, z, x, y)
+            tile_cache.put(key, png)
         return Response(
             content=png,
             media_type="image/png",
@@ -674,10 +681,17 @@ def create_app(
         radar = radar_of(request, slug)
         if not (0 <= z <= MAX_ZOOM) or not (0 <= x < 2**z) or not (0 <= y < 2**z):
             raise HTTPException(status_code=404, detail="Tuile hors de la carte.")
-        frame = await run_in_threadpool(radar.store.load, epoch)
-        if frame is None:
-            raise HTTPException(status_code=404, detail="Image radar inconnue ou déjà purgée.")
-        png = await run_in_threadpool(tile_png, frame, z, x, y)
+        tile_cache: TileCache = request.app.state.tile_cache
+        stamp = radar.store.stamp(epoch)
+        key = radar_key(radar.area.slug, epoch, stamp, z, x, y) if stamp is not None else None
+        png = tile_cache.get(key) if key is not None else None
+        if png is None:
+            frame = await run_in_threadpool(radar.store.load, epoch)
+            if frame is None:
+                raise HTTPException(status_code=404, detail="Image radar inconnue ou déjà purgée.")
+            png = await run_in_threadpool(tile_png, frame, z, x, y)
+            if key is not None:
+                tile_cache.put(key, png)
         return Response(content=png, media_type="image/png", headers={"Cache-Control": "public, max-age=86400, immutable"})
 
     @app.get("/v1/radar/frames", response_model=RadarFramesResponse, tags=["Radar"])
