@@ -75,19 +75,24 @@ services:
     # variable est masquée, comparée à la production) : lifted_index et uv_index_clear_sky ne changeaient rien, retirés.
     # direct_radiation et diffuse_radiation restent : ICON Europe et D2 calculent le rayonnement global avec les deux.
     # cape, convective_inhibition et visibility servent au code du temps (orages, brouillard).
+    # freezing_level_height (iso 0, ajoutée le 27/11/2026 pour la page Montagne de Vigie) : GFS 0,25° (16 jours), ICON Europe
+    # et D2, HRRR et les autres modèles qui la donnent ; ni ECMWF IFS ni GFS 0,11° ne l'ont dans Open-Meteo.
     # ECMWF IFS 9 km et GFS 0,11° (les trois quarts du volume) ont leur propre synchro, juste après.
     # --concurrent 1 ici et 1 là-bas : 2 téléchargements à la fois comme avant, le disque plafonne vers 50 Mo/s.
     command: >
       sync ncep_gfs025,ncep_gefs025,ecmwf_ifs025_ensemble,cams_global,cams_europe,dwd_icon_eu,dwd_icon_d2,ncep_hrrr_conus,cmc_gem_hrdps,jma_msm,jma_gsm,dmi_harmonie_arome_europe,knmi_harmonie_arome_europe,meteoswiss_icon_ch1
-      temperature_2m,apparent_temperature,relative_humidity_2m,dew_point_2m,pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,wind_u_component_10m,wind_v_component_10m,wind_gusts_10m,precipitation,rain,showers,snowfall,snowfall_water_equivalent,weather_code,uv_index,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,shortwave_radiation,direct_radiation,diffuse_radiation,cape,convective_inhibition,precipitation_probability,visibility,is_day,sunshine_duration,frozen_precipitation_percent,pm10,pm2_5,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide,dust,aerosol_optical_depth,european_aqi,us_aqi
+      temperature_2m,apparent_temperature,relative_humidity_2m,dew_point_2m,pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,wind_u_component_10m,wind_v_component_10m,wind_gusts_10m,precipitation,rain,showers,snowfall,snowfall_water_equivalent,weather_code,uv_index,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,shortwave_radiation,direct_radiation,diffuse_radiation,cape,convective_inhibition,precipitation_probability,visibility,is_day,sunshine_duration,frozen_precipitation_percent,freezing_level_height,pm10,pm2_5,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide,dust,aerosol_optical_depth,european_aqi,us_aqi
       --past-days 2 --repeat-interval 60 --concurrent 1
     deploy:
       resources:
         limits:
           memory: 4G
 
-  # ECMWF IFS 9 km et GFS 0,11° à part : sans le rayonnement direct d'ECMWF (2,6 Go) ni le diffus de GFS 0,11° (1,8 Go),
-  # que Vigie n'utilise pas (même essai : aucune valeur changée sans eux), alors qu'ICON a besoin des deux.
+  # ECMWF IFS 9 km et GFS 0,11° à part (deux téléchargements à la fois, voir plus haut). Le rayonnement direct d'ECMWF
+  # (2,6 Go) et le diffus de GFS 0,11° (1,8 Go), retirés le 24/11/2026 (l'essai ne demandait pas l'ensoleillement), sont
+  # revenus le 27/11/2026 : Open-Meteo calcule la durée d'ensoleillement du rayonnement direct, lu tel quel pour ECMWF et
+  # tiré du global moins le diffus pour GFS 0,11°. Sans eux, l'instance ne donnait d'ensoleillement que sur l'échéance
+  # d'ICON Europe (5 jours) ou de HRRR (2 jours) : 0 heure sur 10 jours pour ECMWF et GFS 0,11° à Chamonix (mesuré).
   # GFS 0,11° reste indispensable : sans lui, plus d'UV ni de températures max/min sur 83 % des jours (même essai).
   open-meteo-world-sync-lourds:
     image: ghcr.io/open-meteo/open-meteo:latest
@@ -101,7 +106,7 @@ services:
       - ${OM_WORLD_DATA:-/mnt/om-monde/data}:/app/data
     command: >
       sync ecmwf_ifs,ncep_gfs013
-      temperature_2m,apparent_temperature,relative_humidity_2m,dew_point_2m,pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,wind_u_component_10m,wind_v_component_10m,wind_gusts_10m,precipitation,rain,showers,snowfall,snowfall_water_equivalent,weather_code,uv_index,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,shortwave_radiation,cape,convective_inhibition,precipitation_probability,visibility,is_day,frozen_precipitation_percent
+      temperature_2m,apparent_temperature,relative_humidity_2m,dew_point_2m,pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,wind_u_component_10m,wind_v_component_10m,wind_gusts_10m,precipitation,rain,showers,snowfall,snowfall_water_equivalent,weather_code,uv_index,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,shortwave_radiation,direct_radiation,diffuse_radiation,cape,convective_inhibition,precipitation_probability,visibility,is_day,frozen_precipitation_percent
       --past-days 2 --repeat-interval 60 --concurrent 1
     deploy:
       resources:
