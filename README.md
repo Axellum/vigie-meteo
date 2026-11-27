@@ -179,8 +179,7 @@ Mise en service :
 4. Le port 8081 ne doit être ouvert qu'au tunnel du client (même règle que 8080) ; l'interface publique reste fermée.
 
 Les modèles gardés sont dans les commandes de `open-meteo-world-sync` et de `open-meteo-world-sync-lourds` (ECMWF IFS
-9 km et GFS 0,11°, les trois quarts du volume, synchronisés à part pour ne pas copier le rayonnement direct d'ECMWF ni
-le diffus de GFS, qu'aucune requête de Vigie n'utilise alors qu'ICON a besoin des deux). Les variables ont été triées le
+9 km et GFS 0,11°, les trois quarts du volume, synchronisés à part : deux téléchargements à la fois). Les variables ont été triées le
 24/11/2026 par un essai champ par champ : une API d'essai, où la variable est masquée par un dossier vide, comparée à la
 production sur les requêtes exactes de Vigie en 104 points. `lifted_index`, `uv_index_clear_sky`, le direct d'ECMWF et
 le diffus de GFS 0,11° ne changeaient aucune valeur (≈ 5,7 Go) ; tout le reste changeait au moins un champ (code du
@@ -188,6 +187,17 @@ temps, rayonnement, température ressentie). Sans GFS 0,11°, l'UV et les tempé
 des jours : il reste. ICON monde, UKMO monde et ARPEGE monde ont été
 retirés : ils prenaient 35 Go sans changer l'écart mesuré. Sans ICON Europe et D2, l'écart montait en Allemagne et en
 Suisse.
+
+Le 27/11/2026, Vigie s'est mis à demander la durée d'ensoleillement de chaque jour et l'iso 0 (`freezing_level_height`) :
+
+- **Ensoleillement** : Open-Meteo le calcule du rayonnement direct, lu tel quel pour ECMWF IFS et tiré du rayonnement
+  global moins le diffus pour GFS 0,11°. Sans le direct d'ECMWF ni le diffus de GFS (retirés le 24/11, l'essai ne
+  demandait pas l'ensoleillement), l'instance n'en donnait que sur l'échéance d'ICON Europe (5 jours) ou de HRRR
+  (2 jours), et 0 heure sur 10 jours pour ECMWF et GFS 0,11° à Chamonix. Ils sont revenus dans `open-meteo-world-sync-lourds`
+  (≈ 4,4 Go mesurés le 24/11).
+- **Iso 0** : ajoutée à `open-meteo-world-sync`, pour GFS 0,25° (16 jours), ICON Europe et D2, HRRR et les autres modèles
+  qui la donnent ; ni ECMWF IFS ni GFS 0,11° ne l'ont dans Open-Meteo, ni les modèles de Météo-France. Place estimée
+  ≈ 1 Go (une variable de GFS 0,25° prend 0,2 à 0,5 Go ici).
 
 ## Ménage des vieux morceaux d'Open-Meteo (France et monde)
 
