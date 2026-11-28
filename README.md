@@ -24,7 +24,7 @@ C'est la source météo interne de [Vigie](https://github.com/Axellum/vigie-api)
 | `GET /v1/rain-nowcast/frames` | Échéances (+5 à +60 min, pas de 5 min) du run PIAF déjà en mémoire : heure du run, boîte France, légende et chemin des tuiles (503 sans run chargé) |
 | `GET /v1/rain-nowcast/tiles/{epoch}/{z}/{x}/{y}.png` | Tuile PNG 256 px (Web Mercator, zooms 3 à 10) d'une échéance PIAF en mémoire, même palette que le radar, transparente sans pluie ; `?run=` (le run lu dans `tile_path`) : immuable seulement si c'est le run qui l'a dessinée, sinon gardée 60 s, run dessiné dans `X-Piaf-Run` ; 404 hors run ou hors zooms, 503 sans run chargé |
 | `GET /v1/forecast?...` | Proxy 100 % compatible avec la signature Open-Meteo ; avec `models=meteofrance_seamless` : AROME HD puis ARPEGE Europe, variable par variable (lu par Vigie pour la météo de la France) ; en-têtes `X-Cache-Status` (`fresh` ou `stale`) et `X-Cache-Age` |
-| `GET /v1/shortterm?lat=48.85&lon=2.35` | Grêle, rafales, visibilité et type de précipitation des prochaines heures (jusqu'à 6 h, pas de 15 min) du modèle AROME-PI de Météo-France : une carte de la France par run en mémoire, 404 hors de la métropole et de la Corse, 503 sans run récent : lue par Vigie |
+| `GET /v1/shortterm?lat=48.85&lon=2.35` | Grêle, rafales, visibilité, type et cumul (mm) de précipitation des prochaines heures (jusqu'à 6 h, pas de 15 min) du modèle AROME-PI de Météo-France : une carte de la France par run en mémoire, 404 hors de la métropole et de la Corse, 503 sans run récent : lue par Vigie |
 | `GET /v1/overseas?lat=14.6&lon=-61.0` | Prévision horaire AROME-OM de Météo-France pour un point d'outre-mer (température, humidité, vent, rafales, pression, nébulosité, pluie ; jusqu'à +48 h ; deux runs recollés) : 404 hors des fenêtres servies, 503 sans run récent : lue par Vigie |
 | `GET /v1/station-daily?station=59343001&days=7` | Derniers jours mesurés par une station Météo-France (température minimale et maximale, pluie, vent moyen, rafale ; DPClim) : une commande par station et par jour au plus, hier après 11 h 30 UTC, 503 si le portail ne répond pas : lue par Vigie |
 | `GET /v1/forests?department=11` | Météo des forêts (danger de feux de forêt par département, niveaux 1 à 4, J+1 et J+2) : `status` `available` de juin à septembre, `out_of_season` sinon : lue par Vigie |
@@ -56,10 +56,10 @@ Source : Météo-France, prévision immédiate PIAF (`portail-api.meteofrance.fr
 
 `aromepi/1.0` (WCS `MF-NWP-HIGHRES-AROMEPI-001-FRANCE-WCS`) : un run par heure, publié échéance après échéance, complet une vingtaine de minutes
 après son heure (relevé le 18/11/2026) ; 24 échéances de 15 minutes (jusqu'à +6 h). Le WCS ne rend **qu'une échéance par requête** : un run coûte
-4 produits x 24 échéances = 96 requêtes de la carte de la France (3,5 Mo chacune), espacées (`METEO_AROMEPI_REQUESTS_PER_MINUTE`, 20 par défaut)
+5 produits x 24 échéances = 120 requêtes de la carte de la France (3,5 Mo chacune), espacées (`METEO_AROMEPI_REQUESTS_PER_MINUTE`, 20 par défaut)
 pour laisser le quota de 50 par minute à PIAF et au radar. Chaque carte est réduite aussitôt à des blocs de 4 x 4 nœuds (0,04°, le pire du bloc :
-maximum pour les rafales et la grêle, minimum pour la visibilité, nœud central pour le type de précipitation sauf verglas ou grêle qui l'emportent),
-la grille d'un run tient dans 15 Mo ; les 3 derniers runs complets sont gardés sur disque (`aromepi/` à côté de la base) et un verrou de fichier
+maximum pour les rafales et la grêle, minimum pour la visibilité, nœud central pour le type de précipitation sauf verglas ou grêle qui l'emportent ; la **moyenne** pour le cumul de
+précipitation des 15 min, une quantité et pas un danger), la grille d'un run tient dans 21 Mo ; les 3 derniers runs complets sont gardés sur disque (`aromepi/` à côté de la base) et un verrou de fichier
 fait télécharger un seul des deux processus. Un run incomplet n'est jamais servi. `METEO_AROMEPI_ENABLED=0` coupe la tâche.
 Mesure contre les stations au sol : `python tools/measure_aromepi.py --day AAAA-MM-JJ --hours 2-8` (clé dans `VIGIE_METEOFRANCE_API_KEY`).
 Source : Météo-France, modèle AROME-PI, Licence Ouverte Etalab 2.0 (document de licence de l'API sur le portail, lu le 18/11/2026 ; voir l'ADR 0031 de vigie-api).

@@ -1,14 +1,18 @@
 """Les cartes d'un run AROME-PI réduites à une grille de 0,04° et la lecture d'un point dedans.
 
 AROME-PI (Météo-France, prévision immédiate, run toutes les heures, pas de 15 min jusqu'à +6 h) est lu **par carte de la
-France, pas par point** (comme PIAF) : une requête WCS par produit et par échéance, 24 échéances x 4 produits = 96 requêtes
+France, pas par point** (comme PIAF) : une requête WCS par produit et par échéance, 24 échéances x 5 produits = 120 requêtes
 par run. Chaque carte (1651 x 1051 nœuds à 0,01°, 3,5 Mo en GRIB2) est réduite tout de suite à des blocs de 4 x 4 nœuds
-(0,04°, environ 4,4 km x 2,9 km) : la grille d'un run tient alors dans 15 Mo au lieu de 600 Mo.
+(0,04°, environ 4,4 km x 2,9 km) : la grille d'un run tient alors dans 21 Mo au lieu de 750 Mo.
 
 La réduction garde le pire du bloc, pas la moyenne : le maximum pour les rafales et la grêle, le minimum pour la visibilité.
 Pour le type de précipitation (un code, qu'on ne moyenne pas) : la valeur du nœud central du bloc, sauf si un nœud du
 bloc est verglaçant ou de la grêle, qui l'emportent (les plus graves). Une valeur lue est donc « le pire autour du point »,
 à ne pas confondre avec la valeur exacte au point.
+
+La pluie des 15 minutes est l'exception : la **moyenne** du bloc (mm). Un cumul est une quantité, pas un danger : le maximum
+de 16 nœuds ferait tomber sur tout le bloc l'averse d'un seul kilomètre. Que la pluie touche le bloc, le type de
+précipitation le dit déjà. Un run écrit avant la pluie (fichier sans `rain_mm`) se lit encore : `rain_mm` vaut alors None.
 """
 
 from __future__ import annotations
@@ -42,6 +46,10 @@ def pool_max(values: np.ndarray) -> np.ndarray:
 
 def pool_min(values: np.ndarray) -> np.ndarray:
     return _blocks(values).min(axis=(1, 3))
+
+
+def pool_mean(values: np.ndarray) -> np.ndarray:
+    return _blocks(values).mean(axis=(1, 3))
 
 
 def pool_code(values: np.ndarray) -> np.ndarray:
@@ -84,7 +92,7 @@ class Geometry:
 
 @dataclass
 class AromePiRun:
-    """Un run complet : `gust_kmh`, `hail`, `visibility_m`, `ptype` de forme `[échéance, J, I]` (échéance k = fin de `run + (k+1) x 15 min`)."""
+    """Un run complet : `gust_kmh`, `hail`, `visibility_m`, `ptype`, `rain_mm` de forme `[échéance, J, I]` (échéance k = fin de `run + (k+1) x 15 min`)."""
 
     run: datetime  # UTC
     geometry: Geometry
@@ -92,15 +100,18 @@ class AromePiRun:
     hail: np.ndarray  # float16, kg/m2
     visibility_m: np.ndarray  # uint16
     ptype: np.ndarray  # uint8
+    rain_mm: np.ndarray | None = None  # float16, mm des 15 min (moyenne du bloc) ; None pour un run écrit avant la pluie
 
     def point(self, lat: float, lon: float) -> dict[str, list] | None:
         cell = self.geometry.cell(lat, lon)
         if cell is None:
             return None
         j, i = cell
+        steps = self.gust_kmh.shape[0]
         return {
             "gust_kmh": self.gust_kmh[:, j, i].astype(int).tolist(),
             "hail_kg_m2": [round(float(v), 2) for v in self.hail[:, j, i]],
             "visibility_m": self.visibility_m[:, j, i].astype(int).tolist(),
             "precip_type": self.ptype[:, j, i].astype(int).tolist(),
+            "rain_mm": [None] * steps if self.rain_mm is None else [round(float(v), 2) for v in self.rain_mm[:, j, i]],
         }

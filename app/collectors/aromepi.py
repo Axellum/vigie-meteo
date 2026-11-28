@@ -1,10 +1,10 @@
-"""AROME-PI (prévision immédiate de Météo-France) : grêle, rafales, visibilité et type de précipitation, 6 h, pas de 15 min.
+"""AROME-PI (prévision immédiate de Météo-France) : grêle, rafales, visibilité, type et cumul de précipitation, 6 h, pas de 15 min.
 
 Un run par heure, publié environ 20 minutes après son heure (relevé le 18/11/2026 : le run de 09 h UTC était là à 09 h 19). Le WCS
-`aromepi/1.0` ne rend **qu'une échéance par requête** (`time(a,b)` répond 404) : un run coûte 4 produits x 24 échéances = 96
+`aromepi/1.0` ne rend **qu'une échéance par requête** (`time(a,b)` répond 404) : un run coûte 5 produits x 24 échéances = 120
 requêtes de la carte de la France (3,5 Mo chacune), réduites aussitôt (`app/aromepi_grid.py`). Quota du portail : 50 requêtes par
 minute pour toute la clé (PIAF et la mosaïque radar en prennent aussi) : les requêtes sont espacées (`METEO_AROMEPI_REQUESTS_PER_MINUTE`,
-20 par défaut ; un run en ~5 min) et une échéance déjà lue n'est pas redemandée si le run est repris. Un run incomplet n'est jamais servi.
+20 par défaut ; un run en ~6 min) et une échéance déjà lue n'est pas redemandée si le run est repris. Un run incomplet n'est jamais servi.
 
 Les runs complets sont rangés sur disque (`aromepi/` à côté de la base) : deux processus servent l'API, un verrou de fichier
 (`fcntl`) fait télécharger l'un seulement, l'autre lit le fichier qu'il écrit.
@@ -16,6 +16,8 @@ Produits lus (identifiants WCS relevés dans le `GetCapabilities` du 18/11/2026)
 - `VISIBILITY_MINI_15MIN__GROUND_OR_WATER_SURFACE___<run>` : visibilité minimale des 15 min, m (plafonnée à 20 000).
 - `PRECIPITATION_TYPE_15_MIN__GROUND_OR_WATER_SURFACE___<run>` : type de précipitation le plus grave des 15 min, code de la table
   4.201 de l'OMM et codes locaux 193 et 2xx (« intermittent ») de Météo-France.
+- `TOTAL_PRECIPITATION__GROUND_OR_WATER_SURFACE___<run>_PT15M` : cumul des précipitations des 15 min, kg/m2 = mm (relevé dans le
+  `GetCapabilities` et le `DescribeCoverage` du 28/11/2026 : 24 échéances de 900 à 21 600 s, maille de 0,01°, unité `kg m-2`).
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from pathlib import Path
 import httpx
 import numpy as np
 
-from app.aromepi_grid import STEP_SECONDS, STEPS, AromePiRun, Geometry, pool_code, pool_max, pool_min
+from app.aromepi_grid import STEP_SECONDS, STEPS, AromePiRun, Geometry, pool_code, pool_max, pool_mean, pool_min
 from app.collectors.grib2 import LatLonGrid, decode_latlon_simple
 from app.config import Settings, redact_secret
 
@@ -68,6 +70,7 @@ PRODUCTS = (
     Product("hail", "DIAG_GRELE__GROUND_OR_WATER_SURFACE___{run}", ()),
     Product("visibility", "VISIBILITY_MINI_15MIN__GROUND_OR_WATER_SURFACE___{run}", ()),
     Product("ptype", "PRECIPITATION_TYPE_15_MIN__GROUND_OR_WATER_SURFACE___{run}", ()),
+    Product("rain", "TOTAL_PRECIPITATION__GROUND_OR_WATER_SURFACE___{run}_PT15M", ()),
 )
 
 
@@ -115,6 +118,7 @@ class AromePiStore:
                 hail=run.hail,
                 visibility_m=run.visibility_m,
                 ptype=run.ptype,
+                **({} if run.rain_mm is None else {"rain_mm": run.rain_mm}),
             )
         os.replace(tmp, target)
 
@@ -129,6 +133,7 @@ class AromePiStore:
                     hail=data["hail"],
                     visibility_m=data["visibility_m"],
                     ptype=data["ptype"],
+                    rain_mm=data["rain_mm"] if "rain_mm" in data.files else None,  # run écrit avant la pluie
                 )
         except (FileNotFoundError, ValueError, KeyError, OSError):
             return None
@@ -199,6 +204,8 @@ def reduce_step(product: Product, grid: LatLonGrid) -> np.ndarray:
         return np.clip(pool_max(values), 0.0, 60000.0).astype(np.float16)
     if product.key == "visibility":
         return np.clip(np.rint(pool_min(values)), 0, 65535).astype(np.uint16)
+    if product.key == "rain":  # une quantité : la moyenne du bloc (voir `app/aromepi_grid.py`)
+        return np.clip(pool_mean(values), 0.0, 500.0).astype(np.float16)
     return np.clip(np.rint(pool_code(values)), 0, 255).astype(np.uint8)
 
 
@@ -316,6 +323,7 @@ class AromePiCollector:
             hail=stack("hail"),
             visibility_m=stack("visibility"),
             ptype=stack("ptype"),
+            rain_mm=stack("rain"),
         )
         self._partial_run, self._partial, self._geometry = None, {}, None
         return result
