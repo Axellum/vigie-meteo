@@ -505,7 +505,7 @@ def create_app(
         lat: float = Query(..., ge=-90.0, le=90.0),
         lon: float = Query(..., ge=-180.0, le=180.0),
     ) -> ShortTermResponse:
-        """Grêle, rafales, visibilité et type de précipitation des 6 prochaines heures (AROME-PI, pas de 15 minutes) autour d'un point.
+        """Grêle, rafales, visibilité, type et cumul de précipitation des 6 prochaines heures (AROME-PI, pas de 15 minutes) autour d'un point.
 
         La carte du dernier run est lue en mémoire : le coût ne dépend pas du nombre de points. 404 hors de la métropole et de la Corse,
         503 sans run récent (le client garde alors sa météo habituelle)."""
@@ -529,6 +529,7 @@ def create_app(
                     hail_kg_m2=values["hail_kg_m2"][k],
                     visibility_m=values["visibility_m"][k],
                     precip_type=values["precip_type"][k],
+                    rain_mm=values["rain_mm"][k],
                 )
             )
         if not steps:

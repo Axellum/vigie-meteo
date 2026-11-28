@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from app.aromepi_grid import POOL, STEPS, AromePiRun, Geometry, pool_code, pool_max, pool_min
+from app.aromepi_grid import POOL, STEPS, AromePiRun, Geometry, pool_code, pool_max, pool_mean, pool_min
 from app.collectors.aromepi import (
     PRODUCTS,
     AromePiCollector,
@@ -45,6 +45,18 @@ def test_pooling_keeps_the_worst_of_each_block_and_pads_the_edges() -> None:
     visibility = np.full((6, 6), 20000.0, dtype=np.float32)
     visibility[0, 3] = 150.0
     assert pool_min(visibility).tolist() == [[150.0, 20000.0], [20000.0, 20000.0]]
+
+
+def test_rain_is_the_mean_of_the_block_not_its_worst() -> None:
+    rain = np.zeros((4, 8), dtype=np.float32)
+    rain[0, 0] = 8.0  # une averse sur un seul nœud du bloc (0, 0)
+    rain[:, 4:] = 2.0  # une pluie régulière sur tout le bloc (0, 1)
+    assert pool_mean(rain).tolist() == [[0.5, 2.0]]
+    by_key = {p.key: p for p in PRODUCTS}
+    reduced = reduce_step(by_key["rain"], LatLonGrid(rain, 41.0, 354.0, 0.01, 0.01))
+    assert reduced.dtype == np.float16 and reduced.tolist() == [[0.5, 2.0]]
+    negative = LatLonGrid(np.full((4, 4), -0.01, dtype=np.float32), 41.0, 354.0, 0.01, 0.01)
+    assert reduce_step(by_key["rain"], negative).tolist() == [[0.0]]  # un arrondi négatif du modèle n'est pas une pluie
 
 
 def test_pooling_a_code_takes_the_centre_but_freezing_and_hail_win() -> None:
@@ -84,19 +96,23 @@ def test_geometry_finds_the_block_of_a_point_and_knows_its_edges() -> None:
 # ------------------------------------------------------------------------------------------------ les runs sur disque
 
 
-def make_run(run: datetime, gust: int = 30) -> AromePiRun:
+def make_run(run: datetime, gust: int = 30, with_rain: bool = True) -> AromePiRun:
     geometry = Geometry(41.0, 354.0, 0.01, 0.01, PIAF_NJ, PIAF_NI)
     nj, ni = -(-PIAF_NJ // POOL), -(-PIAF_NI // POOL)
     gusts = np.full((STEPS, nj, ni), 12, dtype=np.uint8)
     hail = np.zeros((STEPS, nj, ni), dtype=np.float16)
     visibility = np.full((STEPS, nj, ni), 20000, dtype=np.uint16)
     ptype = np.zeros((STEPS, nj, ni), dtype=np.uint8)
+    rain = np.zeros((STEPS, nj, ni), dtype=np.float16)
     j, i = PARIS_J // POOL, PARIS_I // POOL
     gusts[SPOT_STEP, j, i] = gust
     hail[SPOT_STEP, j, i] = 17.5
     visibility[SPOT_STEP, j, i] = 120
     ptype[SPOT_STEP, j, i] = 10
-    return AromePiRun(run=run, geometry=geometry, gust_kmh=gusts, hail=hail, visibility_m=visibility, ptype=ptype)
+    rain[SPOT_STEP, j, i] = 3.5
+    return AromePiRun(
+        run=run, geometry=geometry, gust_kmh=gusts, hail=hail, visibility_m=visibility, ptype=ptype, rain_mm=None if not with_rain else rain
+    )
 
 
 def test_store_saves_loads_lists_purges_and_hands_over_the_newest(tmp_path: Path) -> None:
@@ -114,12 +130,22 @@ def test_store_saves_loads_lists_purges_and_hands_over_the_newest(tmp_path: Path
         "hail_kg_m2": [0.0] * SPOT_STEP + [17.5] + [0.0] * (STEPS - SPOT_STEP - 1),
         "visibility_m": [20000] * SPOT_STEP + [120] + [20000] * (STEPS - SPOT_STEP - 1),
         "precip_type": [0] * SPOT_STEP + [10] + [0] * (STEPS - SPOT_STEP - 1),
+        "rain_mm": [0.0] * SPOT_STEP + [3.5] + [0.0] * (STEPS - SPOT_STEP - 1),
     }
     assert run.point(64.1, -21.9) is None
     assert store.latest() is run  # le même objet tant qu'aucun run plus récent n'est écrit
     store.save(make_run(base + timedelta(hours=3)))  # écrit par l'autre processus
     newest = store.latest()
     assert newest is not None and newest.run == base + timedelta(hours=3)
+
+
+def test_a_run_kept_before_the_rain_is_still_served_without_it(tmp_path: Path) -> None:
+    store = AromePiStore(tmp_path)
+    store.save(make_run(datetime(2026, 11, 18, 6, tzinfo=UTC), with_rain=False))  # le fichier d'une passerelle d'avant
+    run = store.latest()
+    assert run is not None and run.rain_mm is None
+    point = run.point(*PARIS)
+    assert point is not None and point["rain_mm"] == [None] * STEPS and point["hail_kg_m2"][SPOT_STEP] == 17.5
 
 
 def test_store_skips_an_unreadable_newest_file(tmp_path: Path) -> None:
@@ -144,12 +170,12 @@ def test_candidates_follow_the_publication_delay() -> None:
 
 def _frame(step: int, kind: str) -> bytes:
     """Une carte de la France entière de ce produit à cette échéance (celle de la forme du vrai WCS)."""
-    background = {"gust": 8.0, "hail": 0.0, "visibility": 20000.0, "ptype": 0.0}[kind]
+    background = {"gust": 8.0, "hail": 0.0, "visibility": 20000.0, "ptype": 0.0, "rain": 0.0}[kind]
     values = np.full((PIAF_NJ, PIAF_NI), background)
     if step == SPOT_STEP + 1:  # les échéances comptent de 1 (15 min) à 24 (6 h)
         spot = (slice(PARIS_J - 1, PARIS_J + 2), slice(PARIS_I - 1, PARIS_I + 2))
-        values[spot] = {"gust": 25.0, "hail": 17.5, "visibility": 120.0, "ptype": 10.0}[kind]
-    decimal = {"gust": 2, "hail": 2, "visibility": 0, "ptype": 0}[kind]
+        values[spot] = {"gust": 25.0, "hail": 17.5, "visibility": 120.0, "ptype": 10.0, "rain": 4.0}[kind]
+    decimal = {"gust": 2, "hail": 2, "visibility": 0, "ptype": 0, "rain": 2}[kind]
     return encode(values[::-1], decimal=decimal)  # `encode` écrit la ligne 0 au nord, `values` compte du sud
 
 
@@ -194,12 +220,14 @@ def make_collector(tmp_path: Path, wcs: FakeWcs, key: str | None = "secret-mf-to
 NOW = datetime(2026, 11, 18, 9, 25, tzinfo=UTC).timestamp()  # le run de 09 h (publié vers 09 h 19) est dû
 
 
-async def test_a_run_costs_96_maps_and_a_point_reads_them(tmp_path: Path) -> None:
+async def test_a_run_costs_120_maps_and_a_point_reads_them(tmp_path: Path) -> None:
     wcs = FakeWcs()
     collector = make_collector(tmp_path, wcs)
     assert await collector.refresh(NOW) is True
     gets = [r for r in wcs.requests if r.url.path.endswith("/GetCoverage")]
-    assert len(gets) == 4 * STEPS
+    assert len(gets) == 5 * STEPS
+    rain_gets = [r for r in gets if r.url.params["coverageid"].startswith("TOTAL_PRECIPITATION__")]
+    assert len(rain_gets) == STEPS and all(r.url.params["coverageid"].endswith("Z_PT15M") for r in rain_gets)
     assert len([r for r in wcs.requests if r.url.path.endswith("/DescribeCoverage")]) == 1
     assert {r.url.params["format"] for r in gets} == {"application/wmo-grib"}
     assert {"long(-6,10.5)", "lat(41,51.5)"} <= set(gets[0].url.params.get_list("subset"))
@@ -211,8 +239,11 @@ async def test_a_run_costs_96_maps_and_a_point_reads_them(tmp_path: Path) -> Non
     assert point is not None
     assert point["gust_kmh"][SPOT_STEP] == 90 and point["gust_kmh"][SPOT_STEP - 1] == 29  # 25 m/s, puis 8 m/s
     assert point["hail_kg_m2"][SPOT_STEP] == 17.5 and point["visibility_m"][SPOT_STEP] == 120 and point["precip_type"][SPOT_STEP] == 10
+    # Pluie de 4 mm sur 3 x 3 nœuds autour de Paris : 6 d'entre eux tombent dans le bloc de Paris (lignes 784-786, colonnes 834-835),
+    # soit une moyenne de 4 x 6 / 16 = 1,5 mm ; l'échéance d'avant est sèche.
+    assert point["rain_mm"][SPOT_STEP] == 1.5 and point["rain_mm"][SPOT_STEP - 1] == 0.0
     far = run.point(43.3, 5.4)  # Marseille : le fond
-    assert far is not None and far["visibility_m"] == [20000] * STEPS
+    assert far is not None and far["visibility_m"] == [20000] * STEPS and far["rain_mm"] == [0.0] * STEPS
 
 
 async def test_nothing_is_asked_when_the_run_is_already_kept_or_not_due(tmp_path: Path) -> None:
@@ -249,7 +280,9 @@ async def test_an_incomplete_run_is_never_served_and_the_retry_skips_what_was_re
     wcs.broken = set()
     assert await collector.refresh(NOW + 200) is True
     second_pass = len(wcs.requests) - first_pass
-    assert second_pass < 4 * STEPS // 2 + 10  # les échéances déjà lues ne sont pas redemandées
+    # Les échéances déjà lues ne sont pas redemandées : la 1re passe a lu les rafales, la grêle et 6 visibilités (~55 cartes),
+    # la reprise lit le reste (~70 avec les sondes), loin des 120 d'un run entier.
+    assert second_pass < 5 * STEPS // 2 + 20
     run = collector.store.latest()
     assert run is not None and run.point(*PARIS)["visibility_m"][SPOT_STEP] == 120  # type: ignore[index]
 
@@ -319,6 +352,7 @@ def test_route_serves_the_steps_not_yet_passed(tmp_path: Path) -> None:
                 "hail_kg_m2": 17.5,
                 "visibility_m": 120,
                 "precip_type": 10,
+                "rain_mm": 3.5,
             }
         assert resp.headers["cache-control"] == "public, max-age=300"
 

@@ -179,6 +179,11 @@ class ShortTermStep(BaseModel):
         "5 neige sèche, 6 neige humide, 7 pluie et neige, 8 granules de glace, 9 grésil, 10 grêle, 11 bruine, 12 bruine verglaçante) "
         "ou code local de Météo-France (193 neige collante, 201 à 213 : la même chose, « intermittent »).",
     )
+    rain_mm: float | None = Field(
+        None,
+        description="Cumul des précipitations des 15 minutes (mm, pluie et neige fondue), moyenne du bloc de 0,04° autour du point. "
+        "null pour un run lu avant que la passerelle garde ce cumul.",
+    )
 
 
 class ShortTermResponse(BaseModel):
